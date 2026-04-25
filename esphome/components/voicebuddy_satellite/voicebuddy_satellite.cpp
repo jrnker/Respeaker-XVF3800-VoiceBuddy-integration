@@ -87,6 +87,10 @@ void VoicebuddySatellite::loop() {
   // Flush any bytes left over from a back-pressured / partial write before
   // we touch the rx side or queue more sends.
   this->flush_tx_pending_();
+  // Same for TTS: drain whatever the speaker chain rejected last tick before
+  // we ingest more from process_rx_, otherwise we stack new chunks on top of
+  // an already-full ring buffer and silently drop most samples.
+  this->flush_tts_pending_();
 
   // Drain anything pending on the socket. process_rx_ may update
   // last_recv_ms_ to a fresher millis() than the `now` snapshot above,
@@ -163,6 +167,7 @@ void VoicebuddySatellite::disconnect_(const char *reason) {
   this->mic_pcm_buf_.clear();
   this->rx_buf_.clear();
   this->tx_pending_.clear();
+  this->tts_pending_.clear();
   this->last_attempt_ms_ = millis();
   this->reconnect_delay_ms_ = std::min<uint32_t>(this->reconnect_delay_ms_ * 2, RECONNECT_BACKOFF_MAX_MS);
   if (was_ready) {
@@ -328,6 +333,23 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
   }
 }
 
+// Cap on how many PCM bytes we're willing to hold back when the speaker
+// chain stalls. 16 kHz / 16-bit / mono = 32 kB/s, so 32 KiB ≈ 1 s of audio.
+// Past that the user-visible lag would be worse than dropping samples.
+static constexpr size_t TTS_PENDING_SOFT_CAP = 32 * 1024;
+
+void VoicebuddySatellite::flush_tts_pending_() {
+  if (this->tts_pending_.empty() || this->speaker_ == nullptr) return;
+  size_t accepted = this->speaker_->play(this->tts_pending_.data(), this->tts_pending_.size());
+  if (accepted == 0) return;  // chain still full, retry next tick
+  if (accepted >= this->tts_pending_.size()) {
+    this->tts_pending_.clear();
+    return;
+  }
+  this->tts_pending_.erase(this->tts_pending_.begin(),
+                           this->tts_pending_.begin() + accepted);
+}
+
 void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len) {
   if (len < 1) return;
   const uint8_t flags = payload[0];
@@ -341,9 +363,31 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
   if (this->speaker_ != nullptr && pcm_len > 0) {
     // ESPHome speaker::Speaker accepts raw PCM. The hub guarantees 16 kHz
     // mono PCM-16 little-endian (see hub/.../bark/server.py); the receiver
-    // YAML must route this through a resampler if its hardware speaker
-    // expects a different rate.
-    this->speaker_->play(pcm, pcm_len);
+    // YAML routes this through a resampler+mixer chain to land at the
+    // hardware rate. play() returns the number of bytes actually queued —
+    // anything above that exceeds the chain's ring buffer and would be
+    // dropped, so park the tail in tts_pending_ and feed it from loop().
+    if (!this->tts_pending_.empty()) {
+      // Already backed up — append (subject to the soft cap) instead of
+      // calling play() and risking out-of-order chunks.
+      if (this->tts_pending_.size() + pcm_len <= TTS_PENDING_SOFT_CAP) {
+        this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
+      } else {
+        ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
+                 (unsigned) this->tts_pending_.size(), (unsigned) pcm_len);
+      }
+    } else {
+      size_t accepted = this->speaker_->play(pcm, pcm_len);
+      if (accepted < pcm_len) {
+        size_t remainder = pcm_len - accepted;
+        if (remainder <= TTS_PENDING_SOFT_CAP) {
+          this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
+        } else {
+          ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
+                   (unsigned) TTS_PENDING_SOFT_CAP, (unsigned) remainder);
+        }
+      }
+    }
   }
 
   if (flags & TTS_FLAG_END) {

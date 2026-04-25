@@ -100,6 +100,7 @@ class VoicebuddySatellite : public Component {
   void send_hello_();
   bool send_frame_(uint8_t typ, const uint8_t *payload, uint16_t len);
   void flush_tx_pending_();
+  void flush_tts_pending_();
   void process_rx_();
   void handle_frame_(uint8_t typ, const uint8_t *payload, uint16_t len);
   void handle_tts_audio_(const uint8_t *payload, uint16_t len);
@@ -127,6 +128,7 @@ class VoicebuddySatellite : public Component {
 
   std::vector<uint8_t> rx_buf_;          // accumulating partial frames
   std::vector<uint8_t> tx_pending_;      // bytes deferred from a back-pressured / partial write
+  std::vector<uint8_t> tts_pending_;     // PCM bytes the speaker chain didn't accept yet
   std::vector<int16_t> mic_pcm_buf_;     // 16 kHz samples awaiting a 320-sample frame
   uint8_t mic_decim_phase_{0};           // round-robin counter for 3:1 decimation
 

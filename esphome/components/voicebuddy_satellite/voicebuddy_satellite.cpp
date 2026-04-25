@@ -62,8 +62,14 @@ void VoicebuddySatellite::setup() {
     this->mic_subscribed_ = true;
   }
 
-  ESP_LOGI(TAG, "voicebuddy_satellite room=%s hub=%s:%u",
-           this->room_id_.c_str(), this->hub_host_.c_str(), this->hub_port_);
+  if (this->has_runtime_config()) {
+    ESP_LOGI(TAG, "voicebuddy_satellite room=%s hub=%s:%u",
+             this->room_id_.c_str(), this->hub_host_.c_str(), this->hub_port_);
+  } else {
+    // Provisioning path: nothing baked in. Wait for set_config_runtime()
+    // from the captive-portal YAML.
+    ESP_LOGI(TAG, "voicebuddy_satellite awaiting runtime config (hub/room not provisioned)");
+  }
 }
 
 void VoicebuddySatellite::dump_config() {
@@ -131,8 +137,70 @@ void VoicebuddySatellite::loop() {
   }
 }
 
+void VoicebuddySatellite::set_config_runtime(const std::string &host, uint16_t port,
+                                             const std::string &room, const std::string &sat) {
+  // Detect a meaningful change. The provisioning YAML calls this every
+  // boot from on_boot, plus whenever the user edits a text/number entity
+  // from the captive-portal page; on a steady-state reboot the values
+  // are identical and there's nothing to do.
+  bool host_changed = host != this->hub_host_;
+  bool port_changed = port != this->hub_port_;
+  bool room_changed = room != this->room_id_;
+  bool sat_changed = !sat.empty() && sat != this->satellite_id_;
+
+  if (!host_changed && !port_changed && !room_changed && !sat_changed) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "runtime config: hub=%s:%u room=%s sat=%s",
+           host.c_str(), port, room.c_str(), sat.empty() ? "(auto)" : sat.c_str());
+
+  this->hub_host_ = host;
+  this->hub_port_ = port;
+  this->room_id_ = room;
+  if (!sat.empty()) {
+    this->satellite_id_ = sat;
+  } else if (this->satellite_id_.empty()) {
+    // Re-derive from MAC if the YAML never gave us one and the user
+    // didn't override via the UI.
+    this->resolve_satellite_id_();
+  }
+
+  // If we're already mid-session and the hub/room moved, drop the link
+  // so the next try_connect_ picks up the new target. Don't tear down on
+  // pure-port-only changes that match the existing session.
+  if (this->state_ != State::DISCONNECTED && (host_changed || port_changed || room_changed)) {
+    this->disconnect_("config-changed");
+  }
+
+  // Re-arm reconnect immediately; try_connect_() will run on the next
+  // loop tick now that has_runtime_config() is true.
+  this->last_attempt_ms_ = 0;
+  this->reconnect_delay_ms_ = RECONNECT_BACKOFF_MIN_MS;
+}
+
+void VoicebuddySatellite::factory_reset_runtime() {
+  ESP_LOGW(TAG, "factory reset: dropping live config");
+  if (this->state_ != State::DISCONNECTED) {
+    this->disconnect_("factory-reset");
+  }
+  this->hub_host_.clear();
+  this->room_id_.clear();
+  // Keep satellite_id_ — the MAC-derived default is still valid and
+  // saves us a step the next time the user provisions.
+}
+
 void VoicebuddySatellite::try_connect_() {
   this->last_attempt_ms_ = millis();
+
+  // First boot before the captive-portal flow has supplied a hub: stay
+  // parked in DISCONNECTED. Once set_config_runtime() pushes a real
+  // host/room in we'll be invoked again the next loop tick.
+  if (!this->has_runtime_config()) {
+    ESP_LOGD(TAG, "no hub configured yet, waiting for provisioning");
+    this->reconnect_delay_ms_ = RECONNECT_BACKOFF_MAX_MS;
+    return;
+  }
 
   struct addrinfo hints {};
   hints.ai_family = AF_UNSPEC;

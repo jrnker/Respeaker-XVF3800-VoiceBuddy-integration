@@ -148,12 +148,17 @@ class VoicebuddySatellite : public Component {
 
 // --- Automation actions ----------------------------------------------
 
+// Action<Ts...>::play takes (const Ts &...x). With Ts empty (e.g. a switch
+// trigger) `(Ts... x)` and `(const Ts &...x)` both collapse to `(void)` and
+// `override` happens to work — but with Ts={std::string} (e.g. mWW's
+// on_wake_word_detected, which surfaces `wake_word`), the value-vs-cref
+// mismatch breaks `override`. Always use `const Ts &...x`.
 template<typename... Ts> class WakeAction : public Action<Ts...> {
  public:
   explicit WakeAction(VoicebuddySatellite *parent) : parent_(parent) {}
   TEMPLATABLE_VALUE(uint8_t, wake_id)
   TEMPLATABLE_VALUE(uint8_t, confidence)
-  void play(Ts... x) override {
+  void play(const Ts &...x) override {
     parent_->on_wake(this->wake_id_.value(x...), this->confidence_.value(x...));
   }
 
@@ -164,7 +169,7 @@ template<typename... Ts> class WakeAction : public Action<Ts...> {
 template<typename... Ts> class StartListeningAction : public Action<Ts...> {
  public:
   explicit StartListeningAction(VoicebuddySatellite *parent) : parent_(parent) {}
-  void play(Ts... x) override { parent_->start_listening(); }
+  void play(const Ts &...x) override { parent_->start_listening(); }
 
  protected:
   VoicebuddySatellite *parent_;
@@ -173,7 +178,7 @@ template<typename... Ts> class StartListeningAction : public Action<Ts...> {
 template<typename... Ts> class StopListeningAction : public Action<Ts...> {
  public:
   explicit StopListeningAction(VoicebuddySatellite *parent) : parent_(parent) {}
-  void play(Ts... x) override { parent_->stop_listening(); }
+  void play(const Ts &...x) override { parent_->stop_listening(); }
 
  protected:
   VoicebuddySatellite *parent_;

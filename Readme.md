@@ -6,6 +6,8 @@ This is the **VoiceBuddy** fork of [`formatBCE/Respeaker-XVF3800-ESPHome-integra
 
 Status: under active development.
 
+**New here?** Start with [`docs/HOWTO-build-and-flash.md`](docs/HOWTO-build-and-flash.md) — step-by-step from a boxed ReSpeaker to a working satellite using ESPHome.
+
 ## Upstream credit
 
 All hardware-facing work (XVF3800 driver, I2S plumbing, LED control, wake-word integration) is by [@formatBCE](https://github.com/formatBCE). This fork only swaps the transport layer.

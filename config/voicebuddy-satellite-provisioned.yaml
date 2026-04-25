@@ -1,0 +1,456 @@
+# VoiceBuddy satellite — runtime-provisioned example.
+#
+# Same hardware wiring as voicebuddy-satellite-minimal.yaml; the only
+# difference is *where the configuration comes from*. The minimal config
+# bakes WiFi credentials, hub host/port and room ID into the firmware via
+# !secret + ${substitutions}. That works fine for one developer flashing
+# their own device, but is unworkable as soon as the same image needs to
+# ship to a Bedroom satellite, a Living Room satellite, a guest install,
+# etc. — each one would otherwise require a fresh recompile + flash.
+#
+# This config replaces all four with NVS-backed runtime values:
+#
+#   - WiFi SSID + password    → ESPHome's built-in `wifi:` provisioning
+#                                (captive portal AP + Improv BLE)
+#   - Hub host + port         → `text:` and `number:` config entities
+#                                with `restore_value: true` (NVS)
+#   - Room ID                 → `text:` config entity, ditto
+#   - Satellite ID (optional) → `text:` config entity; if blank, the
+#                                C++ component falls back to a stable
+#                                MAC-derived default.
+#
+# First-boot UX: device powers up, finds nothing in NVS, falls into the
+# captive-portal AP `voicebuddy-XXXXXX` (last 6 hex of MAC). User joins
+# that AP from a phone, the captive page auto-pops, they fill SSID +
+# password + hub host/port + room ID + (optional) satellite ID, hit
+# Save. ESPHome writes everything to NVS, the device reboots, joins the
+# real WiFi, opens a BARK session to the configured hub.
+#
+# Re-provisioning UX: long-press BUT_A for ≥10 s. The XVF3800 mute
+# switch lights up on press and we time the held duration in firmware;
+# at 10 s the persisted entities are wiped, the live component config is
+# cleared, and the device reboots back into the captive portal. Short
+# presses keep their existing semantics (a quick mute toggle / wake) so
+# this doesn't collide with the v0.1.1 PTT behaviour.
+
+esphome:
+  name: voicebuddy-satellite
+  friendly_name: VoiceBuddy Satellite
+  on_boot:
+    # priority: 600 = before WiFi connects (default WiFi priority is
+    # 250). We push the persisted hub/room into the component before it
+    # tries to TCP-connect, so the very first try_connect_ already has
+    # the right target. set_config_runtime is idempotent on re-runs.
+    - priority: 600
+      then:
+        - voicebuddy_satellite.set_config:
+            id: vb
+            hub_host: !lambda 'return id(provisioned_hub_host).state;'
+            hub_port: !lambda 'return (uint16_t) id(provisioned_hub_port).state;'
+            room_id: !lambda 'return id(provisioned_room_id).state;'
+            satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    version: recommended
+    components:
+      - espressif/esp-nn==1.1.2
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+# WiFi provisioning. NO `ssid:` / `password:` baked in — that's the
+# whole point. ESPHome treats a wifi: block without static credentials
+# (and with no NVS entry yet) as "stay in AP mode and serve the portal".
+# Once the user submits credentials via the captive portal, ESPHome
+# stores them in NVS itself; subsequent boots come up directly on the
+# real WiFi.
+#
+# `ap:` is the fallback the captive portal lives on. The SSID embeds
+# the last bytes of the MAC so multiple satellites in the same flat
+# don't collide. No password — onboarding is a 30-second LAN-side
+# operation and a hidden password just creates a friction barrier.
+wifi:
+  ap:
+    ssid: !lambda |-
+      uint8_t mac[6] = {0};
+      esphome::get_mac_address_raw(mac);
+      char buf[24];
+      snprintf(buf, sizeof(buf), "voicebuddy-%02x%02x%02x", mac[3], mac[4], mac[5]);
+      return std::string(buf);
+  power_save_mode: none
+  reboot_timeout: 0s   # we manage reconnect inside voicebuddy_satellite
+
+network:
+  enable_ipv6: false
+
+# Captive portal: opening any URL while connected to the AP redirects
+# to the ESPHome built-in onboarding page. That page itself includes
+# WiFi setup; the hub/room fields are surfaced on the same web_server
+# as ESPHome entities (text + number) and reachable from the same AP.
+captive_portal:
+
+# web_server exposes the text/number entities so the captive portal
+# page (or the user's phone browser at http://192.168.4.1/) can edit
+# them. Version 3 is the current default; using v3 explicitly so a
+# future ESPHome bump doesn't silently flip the URL scheme.
+web_server:
+  version: 3
+  port: 80
+  # Sort entities so the four provisioning fields cluster at the top,
+  # ahead of diagnostic ones.
+  sorting_groups:
+    - id: provisioning_group
+      name: "Provisioning"
+      sorting_weight: -100
+
+# Improv-over-BLE — onboarding from a phone over BLE without joining
+# the AP first. ESPHome wires this into the same wifi: block above; if
+# the user prefers BLE they can use Home Assistant's "Improv" flow or
+# any standalone Improv app. The captive portal is the recommended
+# path; this is here as a no-cost fallback.
+esp32_improv:
+  authorizer: none
+
+logger:
+  level: INFO
+  logs:
+    voicebuddy: INFO
+    i2s_audio: WARN
+
+external_components:
+  - source:
+      type: local
+      path: ../esphome/components
+  # Patched i2s_audio — see voicebuddy-satellite-minimal.yaml for the
+  # rationale; this fork adds per-source resample so the XVF3800's
+  # native 48 kHz / 32-bit / stereo stream is legal mWW input.
+  - source:
+      type: git
+      url: https://github.com/formatBCE/esphome
+      ref: respeaker_microphone
+    components:
+      - i2s_audio
+    refresh: 0s
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration
+      ref: main
+    components:
+      - respeaker_xvf3800
+      - aic3104
+    refresh: 0s
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    scan: true
+    frequency: 100kHz
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_din_pin: GPIO43
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO44
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: aic3104_dac
+
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: tts_mixing_input
+        timeout: never
+      - id: spare_mixing_input
+        timeout: never
+
+  - platform: resampler
+    id: tts_speaker
+    output_speaker: tts_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+audio_dac:
+  - platform: aic3104
+    id: aic3104_dac
+    i2c_id: internal_i2c
+
+# --- Provisioning-backed config entities -----------------------------
+#
+# All four entities have `restore_value: true` and `optimistic: true`,
+# which means ESPHome stores their last value in NVS and replays it on
+# boot. That replay is what makes the on_boot lambda above see the
+# user's previous answer instead of the empty initial_value.
+#
+# The web UI exposes them under the "Provisioning" group; the captive
+# portal page links to them directly. Setting any of them at runtime
+# triggers the on_value handler, which re-pushes config into the
+# voicebuddy_satellite component and reconnects to the new hub if the
+# host or room changed.
+
+text:
+  - platform: template
+    id: provisioned_hub_host
+    name: "Hub host (IP or DNS)"
+    icon: mdi:server-network
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    min_length: 0
+    max_length: 64
+    mode: text
+    web_server:
+      sorting_group_id: provisioning_group
+      sorting_weight: 1
+    on_value:
+      - voicebuddy_satellite.set_config:
+          id: vb
+          hub_host: !lambda 'return x;'
+          hub_port: !lambda 'return (uint16_t) id(provisioned_hub_port).state;'
+          room_id: !lambda 'return id(provisioned_room_id).state;'
+          satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
+
+  - platform: template
+    id: provisioned_room_id
+    name: "Room ID"
+    icon: mdi:home-map-marker
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    min_length: 0
+    max_length: 16
+    mode: text
+    web_server:
+      sorting_group_id: provisioning_group
+      sorting_weight: 3
+    on_value:
+      - voicebuddy_satellite.set_config:
+          id: vb
+          hub_host: !lambda 'return id(provisioned_hub_host).state;'
+          hub_port: !lambda 'return (uint16_t) id(provisioned_hub_port).state;'
+          room_id: !lambda 'return x;'
+          satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
+
+  - platform: template
+    id: provisioned_satellite_id
+    name: "Satellite ID (optional override)"
+    icon: mdi:tag
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    min_length: 0
+    max_length: 16
+    mode: text
+    web_server:
+      sorting_group_id: provisioning_group
+      sorting_weight: 4
+    on_value:
+      - voicebuddy_satellite.set_config:
+          id: vb
+          hub_host: !lambda 'return id(provisioned_hub_host).state;'
+          hub_port: !lambda 'return (uint16_t) id(provisioned_hub_port).state;'
+          room_id: !lambda 'return id(provisioned_room_id).state;'
+          satellite_id: !lambda 'return x;'
+
+number:
+  - platform: template
+    id: provisioned_hub_port
+    name: "Hub port"
+    icon: mdi:numeric
+    optimistic: true
+    restore_value: true
+    initial_value: 9102
+    min_value: 1
+    max_value: 65535
+    step: 1
+    mode: box
+    web_server:
+      sorting_group_id: provisioning_group
+      sorting_weight: 2
+    on_value:
+      - voicebuddy_satellite.set_config:
+          id: vb
+          hub_host: !lambda 'return id(provisioned_hub_host).state;'
+          hub_port: !lambda 'return (uint16_t) x;'
+          room_id: !lambda 'return id(provisioned_room_id).state;'
+          satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
+
+# --- Long-press factory-reset gesture --------------------------------
+#
+# BUT_A semantics on the XVF3800 board: pressing the physical button
+# tells the DSP to mute its mic; we observe that as `mic_mute_switch`
+# transitioning ON. Existing minimal-config behaviour: any press fires
+# WAKE + auto-unmute (press-to-talk fallback while wake-word is being
+# tuned).
+#
+# We add a SECOND interpretation here: hold the button for ≥10 s and
+# the device factory-resets. The short-press path is unchanged.
+# Implementation: when the switch goes ON, kick off a 10 s timer; if it
+# stays ON for the full duration, reset. If it goes OFF before the
+# timer fires we cancel.
+
+globals:
+  - id: factory_reset_arm_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          // Poll the same mute switch the upstream config exposes. If the
+          // press is still held 10 s after it started, factory-reset.
+          static const uint32_t HOLD_MS = 10000;
+          uint32_t armed_at = id(factory_reset_arm_ms);
+          if (armed_at == 0) return;
+          if (!id(mic_mute_switch).state) {
+            // Released early — abort.
+            id(factory_reset_arm_ms) = 0;
+            return;
+          }
+          if (millis() - armed_at >= HOLD_MS) {
+            ESP_LOGW("voicebuddy", "long-press factory reset triggered");
+            id(factory_reset_arm_ms) = 0;
+            // Wipe the live config inside the running component, drop
+            // the BARK session, then defer the NVS wipe + reboot to
+            // the on_long_press script so logging gets a chance to
+            // flush.
+            id(vb).factory_reset_runtime();
+            id(do_factory_reset).execute();
+          }
+
+script:
+  - id: do_factory_reset
+    then:
+      # Clear the persisted text / number entities so the next boot
+      # falls back into the captive portal. ESPHome's optimistic+
+      # restore_value: true entities expose .publish_state(); writing
+      # an empty string / default port hits the same NVS slot.
+      - lambda: |-
+          id(provisioned_hub_host).publish_state("");
+          id(provisioned_room_id).publish_state("");
+          id(provisioned_satellite_id).publish_state("");
+          id(provisioned_hub_port).publish_state(9102);
+      # Drop the WiFi credentials too — `wifi.clear_credentials`
+      # zeroes the NVS slot ESPHome uses for stored SSID/password.
+      - wifi.clear_credentials:
+      - delay: 500ms
+      - lambda: |-
+          ESP_LOGW("voicebuddy", "rebooting into provisioning mode");
+          App.safe_reboot();
+
+respeaker_xvf3800:
+  id: respeaker
+  address: 0x2C
+  mute_switch:
+    id: mic_mute_switch
+    name: "Microphone Mute"
+    update_interval: 200ms
+    on_turn_on:
+      # Arm the long-press timer for the factory-reset interval check
+      # above. If the user lets go before 10 s elapse, the timer aborts.
+      - lambda: 'id(factory_reset_arm_ms) = millis();'
+      # Existing v0.1.1 short-press behaviour: un-mute and fire WAKE.
+      # Runs immediately on press; if the long-press path also fires
+      # later we'll reset the device anyway, so the brief WAKE is harmless.
+      - switch.turn_off: mic_mute_switch
+      - voicebuddy_satellite.wake:
+          wake_id: 99
+          confidence: 255
+    on_turn_off:
+      - lambda: 'id(factory_reset_arm_ms) = 0;'
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/refs/heads/main/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
+    version: "1.0.7"
+    md5: 043a848f544ff2c7265ac19685daf5de
+
+# Wake-word engine. Identical wiring to the minimal config; the
+# provisioning flow doesn't change anything about how the mic stream is
+# routed into mWW.
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 1
+  stop_after_detection: false
+  models:
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+  vad:
+    probability_cutoff: 0.05
+  on_wake_word_detected:
+    - logger.log:
+        format: "wake word detected: %s"
+        args: [ 'wake_word.c_str()' ]
+    - voicebuddy_satellite.wake:
+        wake_id: 1
+        confidence: 230
+
+# voicebuddy_satellite is configured with NO hub_host / hub_port /
+# room_id / satellite_id at compile time — those land at boot via
+# voicebuddy_satellite.set_config above. The microphone + speaker
+# bindings are identical to the minimal config.
+voicebuddy_satellite:
+  id: vb
+  microphone:
+    microphone: i2s_mics
+    channels: 0
+  speaker: tts_speaker
+  on_connected:
+    - logger.log: "BARK session opened"
+    - micro_wake_word.start:
+  on_disconnected:
+    - logger.log: "BARK session closed"
+    - micro_wake_word.stop:
+  on_tts_end:
+    - voicebuddy_satellite.stop_listening:

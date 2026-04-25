@@ -8,6 +8,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include <cerrno>
 #include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -91,8 +92,8 @@ void VoicebuddySatellite::loop() {
       this->last_ping_ms_ = now;
       this->send_frame_(FRAME_PING, nullptr, 0);
     }
-    // Liveness watchdog — 3 missed pings ⇒ assume the connection is dead.
-    if (now - this->last_recv_ms_ > PING_INTERVAL_MS * 3 + 1000) {
+    // Liveness watchdog — see WATCHDOG_TIMEOUT_MS for sizing rationale.
+    if (now - this->last_recv_ms_ > WATCHDOG_TIMEOUT_MS) {
       this->disconnect_("watchdog");
     }
   }
@@ -184,26 +185,39 @@ void VoicebuddySatellite::send_hello_() {
 bool VoicebuddySatellite::send_frame_(uint8_t typ, const uint8_t *payload, uint16_t len) {
   if (!this->sock_) return false;
 
-  uint8_t header[HEADER_LEN];
-  header[0] = typ;
-  header[1] = (len >> 8) & 0xFF;
-  header[2] = len & 0xFF;
-
-  // Two writes is fine for this volume (50 Hz audio frames). If we hit a
-  // performance wall we'll switch to a single coalesced buffer.
-  ssize_t w = this->sock_->write(header, HEADER_LEN);
-  if (w != static_cast<ssize_t>(HEADER_LEN)) {
-    this->disconnect_("send hdr");
-    return false;
+  // Coalesce header + payload into one write so a frame is never split across
+  // two syscalls — that closes a race where back-pressure stranded a header
+  // without its body and the hub got stuck waiting for bytes.
+  std::vector<uint8_t> frame(HEADER_LEN + len);
+  frame[0] = typ;
+  frame[1] = (len >> 8) & 0xFF;
+  frame[2] = len & 0xFF;
+  if (len > 0 && payload != nullptr) {
+    std::memcpy(frame.data() + HEADER_LEN, payload, len);
   }
-  if (len > 0) {
-    w = this->sock_->write(payload, len);
-    if (w != static_cast<ssize_t>(len)) {
-      this->disconnect_("send pl");
+
+  ssize_t w = this->sock_->write(frame.data(), frame.size());
+  if (w == static_cast<ssize_t>(frame.size())) {
+    return true;
+  }
+  if (w < 0) {
+    int e = errno;
+    if (e == EAGAIN || e == EWOULDBLOCK) {
+      // Kernel TCP send buffer full. AUDIO at 50 Hz fills it faster than WiFi
+      // drains; dropping the frame is cheaper than retrying stale samples and
+      // keeps the connection alive.
+      ESP_LOGW(TAG, "send buffer full, dropping frame typ=0x%02x len=%u", typ, len);
       return false;
     }
+    this->disconnect_("send err");
+    return false;
   }
-  return true;
+  // Short write on a non-blocking stream socket is rare but possible. We
+  // can't safely resume mid-frame without a tx queue, so tear down.
+  ESP_LOGW(TAG, "partial write %d/%u typ=0x%02x", static_cast<int>(w),
+           static_cast<unsigned>(frame.size()), typ);
+  this->disconnect_("partial");
+  return false;
 }
 
 void VoicebuddySatellite::process_rx_() {

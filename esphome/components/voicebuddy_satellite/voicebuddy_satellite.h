@@ -46,6 +46,10 @@ static constexpr size_t AUDIO_FRAME_SAMPLES = AUDIO_FRAME_BYTES / 2;
 static constexpr uint8_t MIC_DECIMATION_FACTOR = 3;
 
 static constexpr uint32_t PING_INTERVAL_MS = 10000;
+// Hub blocks for 1-3 s on STT+TTS during process_wav_turn(); a 31 s watchdog
+// is too tight when several utterances stack up. 60 s gives us six PING
+// windows to recover before declaring the link dead.
+static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 60000;
 static constexpr uint32_t RECONNECT_BACKOFF_MIN_MS = 500;
 static constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 15000;
 

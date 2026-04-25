@@ -1,17 +1,24 @@
 # VoiceBuddy satellite — minimal example.
 #
 # Demonstrates the BARK swap in isolation: drop the stock voice_assistant: +
-# api: blocks, plug in the voicebuddy_satellite component, route mic and
-# microWakeWord callbacks at it. Real deployments will combine this with the
-# rest of formatBCE's full example (LED ring effects, timers, alarm, mute
-# switch, OTA, the AIC3104 codec block, etc.). Keep this file small so the
-# protocol wiring stays readable.
+# api: blocks, plug in the voicebuddy_satellite component, route mic at it.
+# Real deployments will combine this with the rest of formatBCE's full
+# example (LED ring effects, timers, alarm, mute switch, OTA, the full
+# AIC3104 codec block, etc.). Keep this file small so the protocol wiring
+# stays readable.
 #
 # Hardware contract is taken from formatBCE's upstream example
 # (config/respeaker-xvf-satellite-example.yaml): the XVF3800 outputs 48 kHz /
 # 32-bit / stereo over I2S — channel 0 is AEC-processed for ASR, channel 1 is
-# unprocessed and used by microWakeWord. The voicebuddy_satellite component
-# decimates 3:1 in firmware to land on the 16 kHz wire format.
+# unprocessed (originally fed to microWakeWord). The voicebuddy_satellite
+# component decimates 3:1 in firmware to land on the 16 kHz wire format.
+#
+# **No microWakeWord in v0.1.** ESPHome 2026.4.x hard-requires a 16 kHz
+# source mic for micro_wake_word, but the stock XVF3800 firmware outputs at
+# 48 kHz and there's no in-software resampler between them. For first-light
+# we trigger an utterance with the BOOT button (GPIO0) — press to start,
+# the hub's VAD ends the utterance, the satellite stops listening when TTS
+# playback finishes. Wake-word integration is on the v0.2 list.
 
 substitutions:
   hub_host: "192.168.1.50"   # VoiceBuddy hub IP on your LAN
@@ -43,7 +50,6 @@ logger:
   level: INFO
   logs:
     voicebuddy: INFO
-    micro_wake_word: INFO
     i2s_audio: WARN
 
 # NOTE: there is intentionally no `api:` and no `voice_assistant:` block
@@ -141,19 +147,23 @@ respeaker_xvf3800:
     version: "1.0.7"
     md5: 043a848f544ff2c7265ac19685daf5de
 
-micro_wake_word:
-  id: mww
-  microphone:
-    microphone: i2s_mics
-    channels: 1
-  stop_after_detection: false
-  models:
-    - model: hey_jarvis
-      id: hey_jarvis
-  on_wake_word_detected:
-    - voicebuddy_satellite.wake:
-        wake_id: 1
-        confidence: 255
+# Press-to-talk on the BOOT button (GPIO0). Pulled-up by the SoC, active-low
+# when pressed. Sends WAKE + starts the mic stream; stop_listening fires when
+# the hub finishes speaking back.
+binary_sensor:
+  - platform: gpio
+    id: ptt_button
+    name: "Push to talk"
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    on_press:
+      - voicebuddy_satellite.wake:
+          wake_id: 99
+          confidence: 255
 
 voicebuddy_satellite:
   id: vb
@@ -168,3 +178,5 @@ voicebuddy_satellite:
     - logger.log: "BARK session opened"
   on_disconnected:
     - logger.log: "BARK session closed"
+  on_tts_end:
+    - voicebuddy_satellite.stop_listening:

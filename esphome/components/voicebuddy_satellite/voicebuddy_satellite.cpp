@@ -84,6 +84,10 @@ void VoicebuddySatellite::loop() {
       break;
   }
 
+  // Flush any bytes left over from a back-pressured / partial write before
+  // we touch the rx side or queue more sends.
+  this->flush_tx_pending_();
+
   // Drain anything pending on the socket.
   this->process_rx_();
 
@@ -154,6 +158,7 @@ void VoicebuddySatellite::disconnect_(const char *reason) {
   this->listening_ = false;
   this->mic_pcm_buf_.clear();
   this->rx_buf_.clear();
+  this->tx_pending_.clear();
   this->last_attempt_ms_ = millis();
   this->reconnect_delay_ms_ = std::min<uint32_t>(this->reconnect_delay_ms_ * 2, RECONNECT_BACKOFF_MAX_MS);
   if (was_ready) {
@@ -182,18 +187,54 @@ void VoicebuddySatellite::send_hello_() {
   this->send_frame_(FRAME_HELLO, payload, HELLO_LEN);
 }
 
+// Cap on how many bytes we're willing to hold back on a stalled socket
+// before we start dropping new AUDIO frames. ~2× a TTS-sized chunk leaves
+// headroom for a couple of stalled control frames without unbounded growth.
+static constexpr size_t TX_PENDING_SOFT_CAP = 4096;
+
+void VoicebuddySatellite::flush_tx_pending_() {
+  if (this->tx_pending_.empty() || !this->sock_) return;
+  ssize_t w = this->sock_->write(this->tx_pending_.data(), this->tx_pending_.size());
+  if (w == static_cast<ssize_t>(this->tx_pending_.size())) {
+    this->tx_pending_.clear();
+    return;
+  }
+  if (w < 0) {
+    int e = errno;
+    if (e == EAGAIN || e == EWOULDBLOCK) return;  // kernel still full, retry next tick
+    this->disconnect_("flush err");
+    return;
+  }
+  // Partial flush — drop the bytes that made it onto the wire, keep the rest.
+  this->tx_pending_.erase(this->tx_pending_.begin(), this->tx_pending_.begin() + w);
+}
+
 bool VoicebuddySatellite::send_frame_(uint8_t typ, const uint8_t *payload, uint16_t len) {
   if (!this->sock_) return false;
 
-  // Coalesce header + payload into one write so a frame is never split across
-  // two syscalls — that closes a race where back-pressure stranded a header
-  // without its body and the hub got stuck waiting for bytes.
+  // Coalesce header + payload so a frame is never split across two syscalls.
   std::vector<uint8_t> frame(HEADER_LEN + len);
   frame[0] = typ;
   frame[1] = (len >> 8) & 0xFF;
   frame[2] = len & 0xFF;
   if (len > 0 && payload != nullptr) {
     std::memcpy(frame.data() + HEADER_LEN, payload, len);
+  }
+
+  // If we already have a backlog from a previous partial / blocked write,
+  // try to drain it now and only enqueue this frame behind it.
+  if (!this->tx_pending_.empty()) {
+    this->flush_tx_pending_();
+    if (!this->tx_pending_.empty()) {
+      // Still backed up. AUDIO is real-time and lossy by design; dropping a
+      // frame is cheaper than ballooning the queue with stale samples.
+      if (typ == FRAME_AUDIO &&
+          this->tx_pending_.size() + frame.size() > TX_PENDING_SOFT_CAP) {
+        return false;
+      }
+      this->tx_pending_.insert(this->tx_pending_.end(), frame.begin(), frame.end());
+      return true;
+    }
   }
 
   ssize_t w = this->sock_->write(frame.data(), frame.size());
@@ -203,21 +244,18 @@ bool VoicebuddySatellite::send_frame_(uint8_t typ, const uint8_t *payload, uint1
   if (w < 0) {
     int e = errno;
     if (e == EAGAIN || e == EWOULDBLOCK) {
-      // Kernel TCP send buffer full. AUDIO at 50 Hz fills it faster than WiFi
-      // drains; dropping the frame is cheaper than retrying stale samples and
-      // keeps the connection alive.
-      ESP_LOGW(TAG, "send buffer full, dropping frame typ=0x%02x len=%u", typ, len);
-      return false;
+      if (typ == FRAME_AUDIO) {
+        return false;  // drop, don't queue stale audio
+      }
+      this->tx_pending_.assign(frame.begin(), frame.end());
+      return true;
     }
     this->disconnect_("send err");
     return false;
   }
-  // Short write on a non-blocking stream socket is rare but possible. We
-  // can't safely resume mid-frame without a tx queue, so tear down.
-  ESP_LOGW(TAG, "partial write %d/%u typ=0x%02x", static_cast<int>(w),
-           static_cast<unsigned>(frame.size()), typ);
-  this->disconnect_("partial");
-  return false;
+  // Short write — queue the tail and try again next loop tick.
+  this->tx_pending_.assign(frame.begin() + w, frame.end());
+  return true;
 }
 
 void VoicebuddySatellite::process_rx_() {

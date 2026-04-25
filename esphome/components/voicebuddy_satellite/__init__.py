@@ -10,7 +10,8 @@ from esphome import automation
 from esphome.components import microphone, speaker
 from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_SPEAKER, CONF_TRIGGER_ID
 
-DEPENDENCIES = ["network"]
+DEPENDENCIES = ["network", "socket"]
+AUTO_LOAD = ["socket"]
 CODEOWNERS = ["@jrnker"]
 
 voicebuddy_ns = cg.esphome_ns.namespace("voicebuddy_satellite")

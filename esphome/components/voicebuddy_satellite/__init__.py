@@ -8,7 +8,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
 from esphome.components import microphone, speaker
-from esphome.const import CONF_ID, CONF_TRIGGER_ID
+from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_SPEAKER, CONF_TRIGGER_ID
 
 DEPENDENCIES = ["network"]
 CODEOWNERS = ["@jrnker"]
@@ -29,8 +29,6 @@ CONF_HUB_HOST = "hub_host"
 CONF_HUB_PORT = "hub_port"
 CONF_ROOM_ID = "room_id"
 CONF_SATELLITE_ID = "satellite_id"
-CONF_MICROPHONE = "microphone"
-CONF_SPEAKER = "speaker"
 CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_TTS_START = "on_tts_start"
@@ -44,7 +42,12 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_HUB_PORT, default=9102): cv.port,
     cv.Required(CONF_ROOM_ID): cv.All(cv.string_strict, cv.Length(max=16)),
     cv.Optional(CONF_SATELLITE_ID): cv.All(cv.string_strict, cv.Length(max=16)),
-    cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
+    cv.Required(CONF_MICROPHONE): microphone.microphone_source_schema(
+        min_bits_per_sample=16,
+        max_bits_per_sample=16,
+        min_channels=1,
+        max_channels=1,
+    ),
     cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
     cv.Optional(CONF_ON_CONNECTED): automation.validate_automation({
         cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnConnectedTrigger),
@@ -70,8 +73,8 @@ async def to_code(config):
     if CONF_SATELLITE_ID in config:
         cg.add(var.set_satellite_id(config[CONF_SATELLITE_ID]))
 
-    mic = await cg.get_variable(config[CONF_MICROPHONE])
-    cg.add(var.set_microphone(mic))
+    mic_source = await microphone.microphone_source_to_code(config[CONF_MICROPHONE])
+    cg.add(var.set_microphone_source(mic_source))
     if CONF_SPEAKER in config:
         spk = await cg.get_variable(config[CONF_SPEAKER])
         cg.add(var.set_speaker(spk))
@@ -100,7 +103,7 @@ WAKE_ACTION_SCHEMA = cv.Schema({
 
 
 @automation.register_action(
-    "voicebuddy_satellite.wake", WakeAction, WAKE_ACTION_SCHEMA,
+    "voicebuddy_satellite.wake", WakeAction, WAKE_ACTION_SCHEMA, synchronous=False,
 )
 async def wake_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
@@ -116,7 +119,10 @@ SIMPLE_ACTION_SCHEMA = cv.Schema({cv.GenerateID(): cv.use_id(VoicebuddySatellite
 
 
 @automation.register_action(
-    "voicebuddy_satellite.start_listening", StartListeningAction, SIMPLE_ACTION_SCHEMA,
+    "voicebuddy_satellite.start_listening",
+    StartListeningAction,
+    SIMPLE_ACTION_SCHEMA,
+    synchronous=False,
 )
 async def start_listening_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
@@ -124,7 +130,10 @@ async def start_listening_to_code(config, action_id, template_arg, args):
 
 
 @automation.register_action(
-    "voicebuddy_satellite.stop_listening", StopListeningAction, SIMPLE_ACTION_SCHEMA,
+    "voicebuddy_satellite.stop_listening",
+    StopListeningAction,
+    SIMPLE_ACTION_SCHEMA,
+    synchronous=False,
 )
 async def stop_listening_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])

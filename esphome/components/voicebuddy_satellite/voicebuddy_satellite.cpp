@@ -1,6 +1,7 @@
 #include "voicebuddy_satellite.h"
 
 #include "esphome/components/microphone/microphone.h"
+#include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/components/socket/socket.h"
 #include "esphome/core/application.h"
@@ -24,18 +25,17 @@ static constexpr size_t HEADER_LEN = 3;
 // HELLO payload: sat_id(16) | room_id(16) | fw(u32-be) | caps(u32-be)
 static constexpr size_t HELLO_LEN = 16 + 16 + 4 + 4;
 
-// Each AUDIO frame is 320 int16 samples = 640 bytes = 20 ms @ 16 kHz mono.
-static constexpr size_t AUDIO_FRAME_SAMPLES = AUDIO_FRAME_BYTES / 2;
-
 void VoicebuddySatellite::setup() {
   this->resolve_satellite_id_();
   this->rx_buf_.reserve(2048);
   this->mic_pcm_buf_.reserve(AUDIO_FRAME_SAMPLES);
 
-  if (this->mic_ != nullptr) {
-    // ESPHome's mic API delivers callbacks of int16 samples. The hub expects
-    // 16 kHz mono PCM-16; configure the i2s_audio mic block in YAML to match.
-    this->mic_->add_data_callback([this](const std::vector<int16_t> &data) {
+  if (this->mic_source_ != nullptr) {
+    // MicrophoneSource picks our channel and converts to int16 mono. It
+    // delivers a byte vector at the source mic's native rate (48 kHz on the
+    // XVF3800). We decimate 3:1 in on_mic_data_ to land on the 16 kHz wire
+    // format declared in PROTOCOLS.md §5.
+    this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
       this->on_mic_data_(data);
     });
     this->mic_subscribed_ = true;
@@ -50,7 +50,7 @@ void VoicebuddySatellite::dump_config() {
   ESP_LOGCONFIG(TAG, "  Hub: %s:%u", this->hub_host_.c_str(), this->hub_port_);
   ESP_LOGCONFIG(TAG, "  Room ID: %s", this->room_id_.c_str());
   ESP_LOGCONFIG(TAG, "  Satellite ID: %s", this->satellite_id_.c_str());
-  ESP_LOGCONFIG(TAG, "  Microphone: %s", this->mic_ ? "yes" : "no");
+  ESP_LOGCONFIG(TAG, "  Microphone: %s", this->mic_source_ ? "yes" : "no");
   ESP_LOGCONFIG(TAG, "  Speaker: %s", this->speaker_ ? "yes" : "no");
 }
 
@@ -309,6 +309,10 @@ void VoicebuddySatellite::start_listening() {
   if (this->listening_) return;
   this->listening_ = true;
   this->mic_pcm_buf_.clear();
+  this->mic_decim_phase_ = 0;
+  if (this->mic_source_ != nullptr) {
+    this->mic_source_->start();
+  }
   ESP_LOGI(TAG, "listening");
 }
 
@@ -316,18 +320,31 @@ void VoicebuddySatellite::stop_listening() {
   if (!this->listening_) return;
   this->listening_ = false;
   this->mic_pcm_buf_.clear();
+  if (this->mic_source_ != nullptr) {
+    this->mic_source_->stop();
+  }
   ESP_LOGI(TAG, "stopped listening");
 }
 
-void VoicebuddySatellite::on_mic_data_(const std::vector<int16_t> &data) {
+void VoicebuddySatellite::on_mic_data_(const std::vector<uint8_t> &data) {
   if (!this->listening_ || this->state_ != State::READY) return;
 
-  this->mic_pcm_buf_.insert(this->mic_pcm_buf_.end(), data.begin(), data.end());
+  // MicrophoneSource hands us 16-bit little-endian mono frames packed as bytes.
+  const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
+  const size_t sample_count = data.size() / 2;
+
+  // 3:1 decimation: pick every Nth sample. Crude (no anti-alias filter) but
+  // fine for wake-word-triggered short utterances; Whisper handles the slop.
+  for (size_t i = 0; i < sample_count; i++) {
+    if (this->mic_decim_phase_ == 0) {
+      this->mic_pcm_buf_.push_back(samples[i]);
+    }
+    this->mic_decim_phase_ = (this->mic_decim_phase_ + 1) % MIC_DECIMATION_FACTOR;
+  }
 
   while (this->mic_pcm_buf_.size() >= AUDIO_FRAME_SAMPLES) {
-    const int16_t *samples = this->mic_pcm_buf_.data();
     this->send_frame_(FRAME_AUDIO,
-                      reinterpret_cast<const uint8_t *>(samples),
+                      reinterpret_cast<const uint8_t *>(this->mic_pcm_buf_.data()),
                       AUDIO_FRAME_BYTES);
     this->mic_pcm_buf_.erase(this->mic_pcm_buf_.begin(),
                              this->mic_pcm_buf_.begin() + AUDIO_FRAME_SAMPLES);

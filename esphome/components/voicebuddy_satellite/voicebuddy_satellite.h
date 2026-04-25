@@ -13,7 +13,7 @@
 namespace esphome {
 
 namespace microphone {
-class Microphone;
+class MicrophoneSource;
 }
 namespace speaker {
 class Speaker;
@@ -37,8 +37,14 @@ static constexpr uint8_t TTS_FLAG_START = 0x01;
 static constexpr uint8_t TTS_FLAG_CONT = 0x02;
 static constexpr uint8_t TTS_FLAG_END = 0x04;
 
-// 20 ms of 16 kHz mono PCM-16.
+// Wire format: 16 kHz mono PCM-16. 20 ms = 320 samples = 640 bytes per AUDIO frame.
 static constexpr size_t AUDIO_FRAME_BYTES = 640;
+static constexpr size_t AUDIO_FRAME_SAMPLES = AUDIO_FRAME_BYTES / 2;
+
+// XVF3800 native I2S output is 48 kHz; we decimate 3:1 in firmware to keep
+// the wire format stable. v0.2 will negotiate the rate via HELLO.
+static constexpr uint8_t MIC_DECIMATION_FACTOR = 3;
+
 static constexpr uint32_t PING_INTERVAL_MS = 10000;
 static constexpr uint32_t RECONNECT_BACKOFF_MIN_MS = 500;
 static constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 15000;
@@ -56,7 +62,7 @@ class VoicebuddySatellite : public Component {
   }
   void set_room_id(const std::string &r) { room_id_ = r; }
   void set_satellite_id(const std::string &s) { satellite_id_ = s; }
-  void set_microphone(microphone::Microphone *m) { mic_ = m; }
+  void set_microphone_source(microphone::MicrophoneSource *s) { mic_source_ = s; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
 
   // Driven from YAML automations on the wake-word callback.
@@ -92,7 +98,7 @@ class VoicebuddySatellite : public Component {
   void process_rx_();
   void handle_frame_(uint8_t typ, const uint8_t *payload, uint16_t len);
   void handle_tts_audio_(const uint8_t *payload, uint16_t len);
-  void on_mic_data_(const std::vector<int16_t> &data);
+  void on_mic_data_(const std::vector<uint8_t> &data);
   void resolve_satellite_id_();
 
   std::string hub_host_;
@@ -100,7 +106,7 @@ class VoicebuddySatellite : public Component {
   std::string room_id_;
   std::string satellite_id_;  // up to 16 ASCII chars; auto-derived if empty
 
-  microphone::Microphone *mic_{nullptr};
+  microphone::MicrophoneSource *mic_source_{nullptr};
   speaker::Speaker *speaker_{nullptr};
 
   std::unique_ptr<socket::Socket> sock_;
@@ -115,7 +121,8 @@ class VoicebuddySatellite : public Component {
   uint32_t last_recv_ms_{0};
 
   std::vector<uint8_t> rx_buf_;          // accumulating partial frames
-  std::vector<int16_t> mic_pcm_buf_;     // accumulating samples until we have a full 320-sample (640-byte) frame
+  std::vector<int16_t> mic_pcm_buf_;     // 16 kHz samples awaiting a 320-sample frame
+  uint8_t mic_decim_phase_{0};           // round-robin counter for 3:1 decimation
 
   CallbackManager<void()> on_connected_callbacks_;
   CallbackManager<void()> on_disconnected_callbacks_;

@@ -6,6 +6,12 @@
 # rest of formatBCE's full example (LED ring effects, timers, alarm, mute
 # switch, OTA, the AIC3104 codec block, etc.). Keep this file small so the
 # protocol wiring stays readable.
+#
+# Hardware contract is taken from formatBCE's upstream example
+# (config/respeaker-xvf-satellite-example.yaml): the XVF3800 outputs 48 kHz /
+# 32-bit / stereo over I2S — channel 0 is AEC-processed for ASR, channel 1 is
+# unprocessed and used by microWakeWord. The voicebuddy_satellite component
+# decimates 3:1 in firmware to land on the 16 kHz wire format.
 
 substitutions:
   hub_host: "192.168.1.50"   # VoiceBuddy hub IP on your LAN
@@ -44,9 +50,21 @@ logger:
 # here. The voicebuddy_satellite component below replaces both.
 
 external_components:
+  # Local copy of the voicebuddy_satellite component shipped in this fork.
   - source:
       type: local
       path: ../esphome/components
+  # Upstream XVF3800 driver + AIC3104 DAC. Required: without the
+  # respeaker_xvf3800 block the DSP never enters streaming mode and the I2S
+  # input stays silent.
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration
+      ref: main
+    components:
+      - respeaker_xvf3800
+      - aic3104
+    refresh: 0s
 
 i2c:
   - id: internal_i2c
@@ -59,23 +77,37 @@ psram:
   mode: octal
   speed: 80MHz
 
-# Mic configured for what BARK expects on the wire: 16 kHz, 16-bit, mono.
-# The XVF3800 DSP can deliver this directly; reconfigure i2s_input on the
-# full example accordingly.
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+
+# Mic = native XVF3800 output: 48 kHz / 32-bit / stereo. The
+# microphone_source schema inside voicebuddy_satellite (channels: 0) and
+# micro_wake_word (channels: 1) each pick one channel from this stereo source.
 microphone:
   - platform: i2s_audio
     id: i2s_mics
     i2s_din_pin: GPIO43
     adc_type: external
     pdm: false
-    sample_rate: 16000
-    bits_per_sample: 16bit
+    sample_rate: 48000
+    bits_per_sample: 32bit
     i2s_mode: secondary
     i2s_audio_id: i2s_input
-    channel: left
+    channel: stereo
 
-# Speaker chain: a single resampling speaker that lets the hub send 16 kHz
-# mono PCM-16 while the I2S DAC runs at its native rate.
 speaker:
   - platform: i2s_audio
     id: i2s_audio_speaker
@@ -87,19 +119,27 @@ speaker:
     dac_type: external
     channel: stereo
     timeout: never
+    audio_dac: aic3104_dac
+  # Resampler so the hub can keep streaming 16 kHz mono PCM-16 while the
+  # I2S DAC runs at its native 48 kHz / 32-bit.
   - platform: resampler
     id: tts_speaker
     output_speaker: i2s_audio_speaker
     sample_rate: 16000
     bits_per_sample: 16
 
-i2s_audio:
-  - id: i2s_input
-    i2s_lrclk_pin: GPIO46
-    i2s_bclk_pin: GPIO9
-  - id: i2s_output
-    i2s_lrclk_pin: GPIO13
-    i2s_bclk_pin: GPIO12
+audio_dac:
+  - platform: aic3104
+    id: aic3104_dac
+    i2c_id: internal_i2c
+
+respeaker_xvf3800:
+  id: respeaker
+  address: 0x2C
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/refs/heads/main/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
+    version: "1.0.7"
+    md5: 043a848f544ff2c7265ac19685daf5de
 
 micro_wake_word:
   id: mww
@@ -120,7 +160,9 @@ voicebuddy_satellite:
   hub_host: ${hub_host}
   hub_port: ${hub_port}
   room_id: ${room_id}
-  microphone: i2s_mics
+  microphone:
+    microphone: i2s_mics
+    channels: 0
   speaker: tts_speaker
   on_connected:
     - logger.log: "BARK session opened"

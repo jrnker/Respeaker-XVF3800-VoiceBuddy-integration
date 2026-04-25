@@ -74,18 +74,18 @@ esp32:
 # stores them in NVS itself; subsequent boots come up directly on the
 # real WiFi.
 #
-# `ap:` is the fallback the captive portal lives on. The SSID embeds
-# the last bytes of the MAC so multiple satellites in the same flat
-# don't collide. No password — onboarding is a 30-second LAN-side
-# operation and a hidden password just creates a friction barrier.
+# `ap:` is the fallback the captive portal lives on. SSID is a fixed
+# string — `wifi.ap.ssid` is not templatable in ESPHome's schema, so
+# we can't append a MAC suffix from a lambda. If we ever provision
+# multiple satellites side by side and need distinct setup APs, the
+# canonical workaround is `esphome.name_add_mac_suffix: true` +
+# omitting `ap.ssid` (auto-derives from the now-MAC-suffixed device
+# name). Skipped for now because flashing happens one device at a
+# time. No password — onboarding is a 30-second LAN-side operation
+# and a hidden password just creates a friction barrier.
 wifi:
   ap:
-    ssid: !lambda |-
-      uint8_t mac[6] = {0};
-      esphome::get_mac_address_raw(mac);
-      char buf[24];
-      snprintf(buf, sizeof(buf), "voicebuddy-%02x%02x%02x", mac[3], mac[4], mac[5]);
-      return std::string(buf);
+    ssid: "VoiceBuddy Setup"
   power_save_mode: none
   reboot_timeout: 0s   # we manage reconnect inside voicebuddy_satellite
 

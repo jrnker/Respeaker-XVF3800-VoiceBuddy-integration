@@ -41,9 +41,16 @@ IDE. You do **not** need PlatformIO.
 
 ## Step 1 — Install ESPHome
 
-You only need one of these two options.
+You only need one of these two options. **Pick by platform:**
 
-### Option A — Docker (recommended; zero Python setup)
+- **Linux / macOS:** either Option A (Docker) or Option B (pip) works.
+- **Windows:** prefer **Option B (pip)**. Docker Desktop on Windows
+  can't easily pass a COM port into a container without WSL2
+  gymnastics, so the pip path is smoother for the first USB flash.
+  After that first flash everything is OTA and Docker would work
+  fine — but pip is simpler from the start.
+
+### Option A — Docker (Linux / macOS recommended)
 
 ```sh
 docker pull ghcr.io/esphome/esphome:stable
@@ -53,7 +60,9 @@ That's it. From here on, "run `esphome <something>`" means run it
 through Docker — there's a one-liner wrapper at the bottom of this
 section.
 
-### Option B — pip
+### Option B — pip (works everywhere; recommended on Windows)
+
+#### Linux / macOS
 
 ```sh
 python3 -m venv ~/.venv/esphome
@@ -61,19 +70,45 @@ source ~/.venv/esphome/bin/activate
 pip install esphome
 ```
 
-Verify either install:
+#### Windows (PowerShell)
+
+First, make sure Python 3.9+ is installed. If you don't have it,
+grab it from <https://www.python.org/downloads/windows/> and tick
+**"Add python.exe to PATH"** in the installer.
+
+```powershell
+python -m venv $HOME\.venv\esphome
+& $HOME\.venv\esphome\Scripts\Activate.ps1
+pip install esphome
+```
+
+If PowerShell complains *"running scripts is disabled on this
+system"* the first time you run `Activate.ps1`, run this once and
+then retry:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+#### Verify either install
 
 ```sh
-esphome version          # if you used pip
+esphome version          # if you used pip (any platform)
 # or
 docker run --rm ghcr.io/esphome/esphome:stable version
 ```
 
 You should see something like `Version: 2026.x.x`.
 
+> Each new terminal needs the venv re-activated:
+> `source ~/.venv/esphome/bin/activate` (Linux/macOS) or
+> `& $HOME\.venv\esphome\Scripts\Activate.ps1` (Windows PowerShell).
+
 ### Docker wrapper (only if you picked Option A)
 
 Add this to your shell so the rest of the guide reads naturally:
+
+#### Linux / macOS
 
 ```sh
 # in ~/.bashrc or ~/.zshrc
@@ -90,6 +125,23 @@ esphome() {
 Then `source ~/.bashrc` (or open a new terminal). The `--device`
 lines are harmless if those paths don't exist; ESPHome falls back
 to OTA flashing.
+
+#### Windows (PowerShell, OTA-only)
+
+```powershell
+# in $PROFILE
+function esphome {
+  docker run --rm -it `
+    -v "${PWD}:/config" `
+    --network=host `
+    ghcr.io/esphome/esphome:stable @args
+}
+```
+
+Reload with `. $PROFILE`. Note this Windows wrapper has **no
+`--device` line** — Docker Desktop on Windows can't pass through
+COM ports cleanly, so this only works for OTA updates after a
+first flash. For the initial USB flash, use Option B (pip).
 
 ---
 
@@ -159,7 +211,20 @@ A new serial device should appear:
   add yourself to the `dialout` group:
   `sudo usermod -aG dialout $USER` and log out / back in.
 - **macOS:** `/dev/cu.usbmodem*` — find it with `ls /dev/cu.*`.
-- **Windows:** check Device Manager for a new COM port.
+- **Windows:** open **Device Manager** → expand **Ports (COM &
+  LPT)**. You should see a new entry like *"USB Serial Device
+  (COM5)"* or *"Silicon Labs CP210x ... (COM5)"*. Note the `COMn`
+  number — you'll pick it from a menu in step 4b.
+
+  The XIAO ESP32S3 uses native USB-CDC, which Windows 10/11
+  recognise without a driver install. If your board is an older
+  revision with a CP210x or CH340 USB-serial chip and Windows
+  shows a yellow warning triangle, install the matching driver:
+  - CP210x: <https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers>
+  - CH340:  <https://www.wch-ic.com/downloads/CH341SER_ZIP.html>
+
+  After plugging the cable in, give Windows ~5 seconds to enumerate
+  the device before refreshing Device Manager.
 
 ### 4b — Compile and upload
 
@@ -170,12 +235,17 @@ cd config
 esphome run voicebuddy-satellite-minimal.yaml
 ```
 
+(Same command on Windows PowerShell — `cd` and `esphome run` work
+identically there.)
+
 ESPHome will:
 
 1. Download all dependencies (this takes 5–10 minutes the first time;
    subsequent builds are fast).
 2. Compile the firmware (~2 minutes).
-3. Ask which port to use — pick the one matching your ReSpeaker.
+3. Ask which port to use — pick the one matching your ReSpeaker
+   (`/dev/ttyACM0` on Linux, `/dev/cu.usbmodem...` on macOS, `COMn`
+   on Windows).
 4. Flash the firmware over USB.
 5. Start showing live logs from the device.
 
@@ -255,11 +325,25 @@ Three things to check, in order.
 1. Is the hub actually listening on 9102?
    On the hub host: `ss -tlnp | grep 9102` should show the
    orchestrator process bound to that port.
-2. Is your firewall in the way? Try
-   `nc -vz <hub-ip> 9102` from another machine on the same LAN.
+2. Is your firewall in the way? Try connecting to the BARK port
+   from another machine on the same LAN:
+   - **Linux / macOS:** `nc -vz <hub-ip> 9102`
+   - **Windows (PowerShell):** `Test-NetConnection -ComputerName <hub-ip> -Port 9102`
+     (look for `TcpTestSucceeded : True`).
 3. Did the satellite get a routable IP? Check the boot logs for
    `wifi: assigned IP ...` — `0.0.0.0` or no log line means the
    WiFi credentials in `secrets.yaml` are wrong.
+
+**Windows: `esphome` not found / "command not recognized":**
+You opened a fresh terminal and didn't re-activate the venv.
+Run `& $HOME\.venv\esphome\Scripts\Activate.ps1` again. (Or add
+the venv's `Scripts` directory to your PATH for the long term.)
+
+**Windows: "Access denied" on the COM port:**
+Some other application has the port open — common culprits are the
+Arduino IDE Serial Monitor, PuTTY, or another ESPHome instance.
+Close them and try again. Unplugging and replugging the USB cable
+also resets the OS-side handle.
 
 **Wake word never fires:**
 microWakeWord works best with a clear command voice and minimal

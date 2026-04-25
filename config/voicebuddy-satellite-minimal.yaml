@@ -139,7 +139,9 @@ speaker:
   # Mixer stage: takes 16-bit input from the resampler and produces the
   # 32-bit / stereo stream that i2s_audio_speaker expects. Without this
   # stage i2s_audio rejects the stream with "Audio stream settings are
-  # not compatible with this I2S configuration".
+  # not compatible with this I2S configuration". ESPHome requires the
+  # mixer to have ≥2 sources; we only use tts_mixing_input, the second
+  # is a no-op placeholder so the schema validates.
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
@@ -147,6 +149,8 @@ speaker:
     task_stack_in_psram: true
     source_speakers:
       - id: tts_mixing_input
+        timeout: never
+      - id: spare_mixing_input
         timeout: never
 
   # Resampler: hub streams 16 kHz / 16-bit / mono PCM; this lifts it to

@@ -41,12 +41,12 @@ static constexpr uint8_t TTS_FLAG_CONT = 0x02;
 static constexpr uint8_t TTS_FLAG_END = 0x04;
 
 // Wire format: 16 kHz mono PCM-16. 20 ms = 320 samples = 640 bytes per AUDIO frame.
+// The patched i2s_audio (formatBCE/esphome:respeaker_microphone) resamples
+// the XVF3800's native 48 kHz / 32-bit / stereo down to 16 kHz / 16-bit /
+// mono inside the microphone source, so consumers see 16 kHz directly and
+// no firmware-side decimation is needed.
 static constexpr size_t AUDIO_FRAME_BYTES = 640;
 static constexpr size_t AUDIO_FRAME_SAMPLES = AUDIO_FRAME_BYTES / 2;
-
-// XVF3800 native I2S output is 48 kHz; we decimate 3:1 in firmware to keep
-// the wire format stable. v0.2 will negotiate the rate via HELLO.
-static constexpr uint8_t MIC_DECIMATION_FACTOR = 3;
 
 static constexpr uint32_t PING_INTERVAL_MS = 10000;
 // Hub blocks for 1-3 s on STT+TTS during process_wav_turn(); a 31 s watchdog
@@ -138,7 +138,6 @@ class VoicebuddySatellite : public Component {
   std::vector<uint8_t> tx_pending_;      // bytes deferred from a back-pressured / partial write
   std::vector<uint8_t> tts_pending_;     // PCM bytes the speaker chain didn't accept yet
   std::vector<int16_t> mic_pcm_buf_;     // 16 kHz samples awaiting a 320-sample frame
-  uint8_t mic_decim_phase_{0};           // round-robin counter for 3:1 decimation
 
   CallbackManager<void()> on_connected_callbacks_;
   CallbackManager<void()> on_disconnected_callbacks_;

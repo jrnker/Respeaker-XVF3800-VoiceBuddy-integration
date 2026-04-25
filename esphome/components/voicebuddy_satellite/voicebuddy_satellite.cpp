@@ -49,10 +49,12 @@ void VoicebuddySatellite::setup() {
   this->sock_mutex_ = xSemaphoreCreateMutex();
 
   if (this->mic_source_ != nullptr) {
-    // MicrophoneSource picks our channel and converts to int16 mono. It
-    // delivers a byte vector at the source mic's native rate (48 kHz on the
-    // XVF3800). We decimate 3:1 in on_mic_data_ to land on the 16 kHz wire
-    // format declared in PROTOCOLS.md §5.
+    // MicrophoneSource picks our channel and converts to int16 mono at the
+    // wire-format rate (16 kHz). The patched i2s_audio from
+    // formatBCE/esphome:respeaker_microphone resamples 48 kHz → 16 kHz at
+    // the source layer so each consumer (us, micro_wake_word) gets 16 kHz
+    // directly. Earlier v0.1 firmware did its own 3:1 decimation here
+    // because the mic source ran at the raw 48 kHz; that's now gone.
     this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
       this->on_mic_data_(data);
     });
@@ -451,7 +453,6 @@ void VoicebuddySatellite::start_listening() {
   if (this->listening_) return;
   this->listening_ = true;
   this->mic_pcm_buf_.clear();
-  this->mic_decim_phase_ = 0;
   if (this->mic_source_ != nullptr) {
     this->mic_source_->start();
   }
@@ -471,18 +472,12 @@ void VoicebuddySatellite::stop_listening() {
 void VoicebuddySatellite::on_mic_data_(const std::vector<uint8_t> &data) {
   if (!this->listening_ || this->state_ != State::READY) return;
 
-  // MicrophoneSource hands us 16-bit little-endian mono frames packed as bytes.
+  // MicrophoneSource hands us 16 kHz / 16-bit / mono PCM, already framed at
+  // the wire-format rate by the patched i2s_audio. Buffer samples until we
+  // have a full 320-sample (640-byte) AUDIO frame, then ship.
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   const size_t sample_count = data.size() / 2;
-
-  // 3:1 decimation: pick every Nth sample. Crude (no anti-alias filter) but
-  // fine for wake-word-triggered short utterances; Whisper handles the slop.
-  for (size_t i = 0; i < sample_count; i++) {
-    if (this->mic_decim_phase_ == 0) {
-      this->mic_pcm_buf_.push_back(samples[i]);
-    }
-    this->mic_decim_phase_ = (this->mic_decim_phase_ + 1) % MIC_DECIMATION_FACTOR;
-  }
+  this->mic_pcm_buf_.insert(this->mic_pcm_buf_.end(), samples, samples + sample_count);
 
   while (this->mic_pcm_buf_.size() >= AUDIO_FRAME_SAMPLES) {
     this->send_frame_(FRAME_AUDIO,

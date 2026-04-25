@@ -23,6 +23,22 @@ static const char *const TAG = "voicebuddy";
 //   typ (u8) | length (u16-be) | payload
 static constexpr size_t HEADER_LEN = 3;
 
+namespace {
+// RAII guard around the per-instance socket mutex. send_frame_ runs from
+// both the main loop and the i2s mic task; without serialising they race
+// on sock_ and tx_pending_, and a disconnect from one task crashes the
+// other mid-write.
+struct SockLock {
+  SemaphoreHandle_t s;
+  explicit SockLock(SemaphoreHandle_t sem) : s(sem) {
+    if (s != nullptr) xSemaphoreTake(s, portMAX_DELAY);
+  }
+  ~SockLock() {
+    if (s != nullptr) xSemaphoreGive(s);
+  }
+};
+}  // namespace
+
 // HELLO payload: sat_id(16) | room_id(16) | fw(u32-be) | caps(u32-be)
 static constexpr size_t HELLO_LEN = 16 + 16 + 4 + 4;
 
@@ -30,6 +46,7 @@ void VoicebuddySatellite::setup() {
   this->resolve_satellite_id_();
   this->rx_buf_.reserve(2048);
   this->mic_pcm_buf_.reserve(AUDIO_FRAME_SAMPLES);
+  this->sock_mutex_ = xSemaphoreCreateMutex();
 
   if (this->mic_source_ != nullptr) {
     // MicrophoneSource picks our channel and converts to int16 mono. It
@@ -157,16 +174,19 @@ void VoicebuddySatellite::try_connect_() {
 
 void VoicebuddySatellite::disconnect_(const char *reason) {
   ESP_LOGW(TAG, "disconnecting: %s", reason);
-  if (this->sock_) {
-    this->sock_->close();
-    this->sock_.reset();
+  {
+    SockLock g(this->sock_mutex_);
+    if (this->sock_) {
+      this->sock_->close();
+      this->sock_.reset();
+    }
+    this->tx_pending_.clear();
   }
   bool was_ready = (this->state_ == State::READY);
   this->state_ = State::DISCONNECTED;
   this->listening_ = false;
   this->mic_pcm_buf_.clear();
   this->rx_buf_.clear();
-  this->tx_pending_.clear();
   this->tts_pending_.clear();
   this->last_attempt_ms_ = millis();
   this->reconnect_delay_ms_ = std::min<uint32_t>(this->reconnect_delay_ms_ * 2, RECONNECT_BACKOFF_MAX_MS);
@@ -202,25 +222,28 @@ void VoicebuddySatellite::send_hello_() {
 static constexpr size_t TX_PENDING_SOFT_CAP = 4096;
 
 void VoicebuddySatellite::flush_tx_pending_() {
-  if (this->tx_pending_.empty() || !this->sock_) return;
-  ssize_t w = this->sock_->write(this->tx_pending_.data(), this->tx_pending_.size());
-  if (w == static_cast<ssize_t>(this->tx_pending_.size())) {
-    this->tx_pending_.clear();
-    return;
+  bool need_disconnect = false;
+  {
+    SockLock g(this->sock_mutex_);
+    if (this->tx_pending_.empty() || !this->sock_) return;
+    ssize_t w = this->sock_->write(this->tx_pending_.data(), this->tx_pending_.size());
+    if (w == static_cast<ssize_t>(this->tx_pending_.size())) {
+      this->tx_pending_.clear();
+      return;
+    }
+    if (w < 0) {
+      int e = errno;
+      if (e == EAGAIN || e == EWOULDBLOCK) return;  // kernel still full, retry next tick
+      need_disconnect = true;
+    } else {
+      // Partial flush — drop the bytes that made it onto the wire, keep the rest.
+      this->tx_pending_.erase(this->tx_pending_.begin(), this->tx_pending_.begin() + w);
+    }
   }
-  if (w < 0) {
-    int e = errno;
-    if (e == EAGAIN || e == EWOULDBLOCK) return;  // kernel still full, retry next tick
-    this->disconnect_("flush err");
-    return;
-  }
-  // Partial flush — drop the bytes that made it onto the wire, keep the rest.
-  this->tx_pending_.erase(this->tx_pending_.begin(), this->tx_pending_.begin() + w);
+  if (need_disconnect) this->disconnect_("flush err");
 }
 
 bool VoicebuddySatellite::send_frame_(uint8_t typ, const uint8_t *payload, uint16_t len) {
-  if (!this->sock_) return false;
-
   // Coalesce header + payload so a frame is never split across two syscalls.
   std::vector<uint8_t> frame(HEADER_LEN + len);
   frame[0] = typ;
@@ -230,41 +253,60 @@ bool VoicebuddySatellite::send_frame_(uint8_t typ, const uint8_t *payload, uint1
     std::memcpy(frame.data() + HEADER_LEN, payload, len);
   }
 
-  // If we already have a backlog from a previous partial / blocked write,
-  // try to drain it now and only enqueue this frame behind it.
-  if (!this->tx_pending_.empty()) {
-    this->flush_tx_pending_();
-    if (!this->tx_pending_.empty()) {
-      // Still backed up. AUDIO is real-time and lossy by design; dropping a
-      // frame is cheaper than ballooning the queue with stale samples.
-      if (typ == FRAME_AUDIO &&
-          this->tx_pending_.size() + frame.size() > TX_PENDING_SOFT_CAP) {
-        return false;
-      }
-      this->tx_pending_.insert(this->tx_pending_.end(), frame.begin(), frame.end());
-      return true;
-    }
-  }
+  bool need_disconnect = false;
+  bool ok = false;
+  {
+    SockLock g(this->sock_mutex_);
+    if (!this->sock_) return false;
 
-  ssize_t w = this->sock_->write(frame.data(), frame.size());
-  if (w == static_cast<ssize_t>(frame.size())) {
-    return true;
-  }
-  if (w < 0) {
-    int e = errno;
-    if (e == EAGAIN || e == EWOULDBLOCK) {
-      if (typ == FRAME_AUDIO) {
-        return false;  // drop, don't queue stale audio
+    // If we already have a backlog from a previous partial / blocked write,
+    // try to drain it inline before queueing more behind it. (Inline drain
+    // because flush_tx_pending_ would deadlock on the same mutex.)
+    if (!this->tx_pending_.empty()) {
+      ssize_t fw = this->sock_->write(this->tx_pending_.data(), this->tx_pending_.size());
+      if (fw == static_cast<ssize_t>(this->tx_pending_.size())) {
+        this->tx_pending_.clear();
+      } else if (fw > 0) {
+        this->tx_pending_.erase(this->tx_pending_.begin(),
+                                this->tx_pending_.begin() + fw);
       }
-      this->tx_pending_.assign(frame.begin(), frame.end());
+      // Negative fw with EWOULDBLOCK is fine — we'll just queue this frame.
+
+      if (!this->tx_pending_.empty()) {
+        // Still backed up. AUDIO is real-time and lossy by design; dropping
+        // a frame is cheaper than ballooning the queue with stale samples.
+        if (typ == FRAME_AUDIO &&
+            this->tx_pending_.size() + frame.size() > TX_PENDING_SOFT_CAP) {
+          return false;
+        }
+        this->tx_pending_.insert(this->tx_pending_.end(), frame.begin(), frame.end());
+        return true;
+      }
+    }
+
+    ssize_t w = this->sock_->write(frame.data(), frame.size());
+    if (w == static_cast<ssize_t>(frame.size())) {
       return true;
     }
-    this->disconnect_("send err");
-    return false;
+    if (w < 0) {
+      int e = errno;
+      if (e == EAGAIN || e == EWOULDBLOCK) {
+        if (typ == FRAME_AUDIO) {
+          return false;  // drop, don't queue stale audio
+        }
+        this->tx_pending_.assign(frame.begin(), frame.end());
+        return true;
+      }
+      need_disconnect = true;
+      ok = false;
+    } else {
+      // Short write — queue the tail and try again next loop tick.
+      this->tx_pending_.assign(frame.begin() + w, frame.end());
+      return true;
+    }
   }
-  // Short write — queue the tail and try again next loop tick.
-  this->tx_pending_.assign(frame.begin() + w, frame.end());
-  return true;
+  if (need_disconnect) this->disconnect_("send err");
+  return ok;
 }
 
 void VoicebuddySatellite::process_rx_() {

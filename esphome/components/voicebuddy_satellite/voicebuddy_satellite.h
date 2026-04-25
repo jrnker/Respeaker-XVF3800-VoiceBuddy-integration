@@ -5,6 +5,9 @@
 #include "esphome/core/helpers.h"
 #include "esphome/components/socket/socket.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -116,6 +119,11 @@ class VoicebuddySatellite : public Component {
   speaker::Speaker *speaker_{nullptr};
 
   std::unique_ptr<socket::Socket> sock_;
+  // Mutex serialising all access to sock_ and tx_pending_. The mic task
+  // (i2s_audio's mic_task) calls send_frame_ from a different FreeRTOS
+  // task than loop()/disconnect_, so without this they race and one
+  // task can write to a socket the other just freed.
+  SemaphoreHandle_t sock_mutex_{nullptr};
   State state_{State::DISCONNECTED};
   bool listening_{false};
   bool mic_subscribed_{false};

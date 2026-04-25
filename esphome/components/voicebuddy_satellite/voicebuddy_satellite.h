@@ -77,6 +77,11 @@ class VoicebuddySatellite : public Component {
   void start_listening();
   void stop_listening();
 
+  // Procedural two-tone confirmation, played through the configured speaker
+  // when a wake fires. Replaces an audio_file:/media_player: stack we'd
+  // otherwise need just for one short beep.
+  void play_wake_beep_();
+
   void add_on_connected_callback(std::function<void()> &&cb) {
     on_connected_callbacks_.add(std::move(cb));
   }

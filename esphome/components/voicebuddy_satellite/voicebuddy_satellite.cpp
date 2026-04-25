@@ -9,6 +9,7 @@
 #include "esphome/core/log.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -446,7 +447,63 @@ void VoicebuddySatellite::on_wake(uint8_t wake_id, uint8_t confidence) {
   }
   uint8_t payload[2] = {wake_id, confidence};
   this->send_frame_(FRAME_WAKE, payload, sizeof(payload));
+  this->play_wake_beep_();
   this->start_listening();
+}
+
+void VoicebuddySatellite::play_wake_beep_() {
+  if (this->speaker_ == nullptr) return;
+
+  // Two short rising tones with quick fades — pleasant, ~210 ms total.
+  // The configured speaker is `tts_speaker` (resampler), which accepts
+  // 16 kHz / 16-bit / mono PCM; the rest of the chain widens to 48 kHz /
+  // 32-bit / stereo for the AIC3104 DAC. Channel 0 of the mic is
+  // AEC-processed, so the beep won't bleed into the audio sent uplink.
+  constexpr uint32_t SAMPLE_RATE = 16000;
+  constexpr float TONE1_HZ = 1000.0f;
+  constexpr float TONE2_HZ = 1320.0f;  // major third + perfect fourth-ish
+  constexpr uint32_t TONE_MS = 60;
+  constexpr uint32_t GAP_MS = 30;
+  constexpr uint32_t FADE_MS = 8;
+  constexpr float AMPLITUDE = 0.20f;  // -14 dBFS, deliberately gentle
+  constexpr float TWO_PI = 6.28318530718f;
+
+  const size_t tone_samples = (SAMPLE_RATE * TONE_MS) / 1000;
+  const size_t gap_samples = (SAMPLE_RATE * GAP_MS) / 1000;
+  const size_t fade_samples = (SAMPLE_RATE * FADE_MS) / 1000;
+  const size_t total_samples = tone_samples * 2 + gap_samples;
+
+  std::vector<int16_t> pcm(total_samples, 0);
+
+  auto write_tone = [&](size_t offset, float freq) {
+    const float w = TWO_PI * freq / static_cast<float>(SAMPLE_RATE);
+    for (size_t i = 0; i < tone_samples; i++) {
+      float env = AMPLITUDE;
+      if (i < fade_samples) {
+        env *= static_cast<float>(i) / static_cast<float>(fade_samples);
+      } else if (i >= tone_samples - fade_samples) {
+        env *= static_cast<float>(tone_samples - i) / static_cast<float>(fade_samples);
+      }
+      float s = sinf(w * static_cast<float>(i));
+      pcm[offset + i] = static_cast<int16_t>(s * env * 32767.0f);
+    }
+  };
+
+  write_tone(0, TONE1_HZ);
+  // gap is already zero
+  write_tone(tone_samples + gap_samples, TONE2_HZ);
+
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(pcm.data());
+  const size_t total_bytes = pcm.size() * sizeof(int16_t);
+  size_t accepted = this->speaker_->play(bytes, total_bytes);
+  if (accepted < total_bytes) {
+    // Park the rest in tts_pending_ so loop()'s flush_tts_pending_ drains it.
+    size_t remainder = total_bytes - accepted;
+    if (this->tts_pending_.size() + remainder <= TTS_PENDING_SOFT_CAP) {
+      this->tts_pending_.insert(this->tts_pending_.end(),
+                                 bytes + accepted, bytes + total_bytes);
+    }
+  }
 }
 
 void VoicebuddySatellite::start_listening() {

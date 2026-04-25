@@ -267,16 +267,26 @@ That's the BARK handshake — your satellite is talking to the hub.
 
 ## Step 5 — Test it
 
-Say the wake word configured in the YAML (`Hey Jarvis` by default —
-change to `okay_nabu` or another supported model in the
-`micro_wake_word:` block if you prefer). The satellite's LED ring
+The minimal example uses **press-to-talk on the BOOT button (GPIO0)**,
+not a wake word. Press and release once to start the utterance, then
+speak. The hub's VAD detects when you stop talking, dispatches the
+intent, and streams the spoken reply back. The satellite's LED ring
 will not light up yet (LED frames are v0.2 work — see
 `docs/PROTOCOLS.md` §5 in the [VoiceHA](https://github.com/jrnker/VoiceHA)
-repo). But on the hub you should see something like:
+repo).
+
+> **Why no wake word in v0.1?** ESPHome 2026.4.x hard-requires a
+> 16 kHz source mic for `micro_wake_word`, but the stock XVF3800
+> firmware (`lr48-sqr`) outputs 48 kHz natively and there's no
+> in-software resampler in the path. Wake-word integration is on the
+> v0.2 list — see the BUILD-LOG entry in the VoiceHA repo for the
+> options under consideration.
+
+On the hub you should see something like:
 
 ```
 bark.hello peer=('192.168.1.42', 51234) room=kitchen sat_id=...
-bark.wake room=kitchen wake_id=1 conf=255
+bark.wake room=kitchen wake_id=99 conf=255
 bark.vad end_of_speech room=kitchen bytes=48000
 stt room=kitchen text='vad är klockan'
 turn room=kitchen total_ms=1240 stt_ms=420 dispatch_ms=80 tts_ms=510
@@ -345,13 +355,12 @@ Arduino IDE Serial Monitor, PuTTY, or another ESPHome instance.
 Close them and try again. Unplugging and replugging the USB cable
 also resets the OS-side handle.
 
-**Wake word never fires:**
-microWakeWord works best with a clear command voice and minimal
-background noise the first time you test. The default cutoffs are
-moderately strict to avoid false wakes — if it doesn't fire, try
-saying it more clearly or change the model. The supported models
-are listed in the upstream
-[microWakeWord repo](https://github.com/kahrendt/microWakeWord).
+**The BOOT-button press doesn't trigger an utterance:**
+Verify the binary_sensor logs a press: ESPHome should emit a
+`'Push to talk': Sending state ON` line when you press it. If
+nothing logs, the GPIO pin number is wrong for your specific board
+revision — try GPIO9 (some XIAO ESP32S3 variants) or whichever pin
+your board's USR / BOOT button is wired to.
 
 **Audio plays back distorted or silent:**
 The minimal YAML uses a `resampler` speaker chain that converts the

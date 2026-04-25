@@ -13,17 +13,21 @@
 # unprocessed (originally fed to microWakeWord). The voicebuddy_satellite
 # component decimates 3:1 in firmware to land on the 16 kHz wire format.
 #
-# **No microWakeWord in v0.1.** ESPHome 2026.4.x hard-requires a 16 kHz
-# source mic for micro_wake_word, but the stock XVF3800 firmware outputs at
-# 48 kHz and there's no in-software resampler between them. Wake-word
-# integration is on the v0.2 list.
+# **microWakeWord on satellite (v0.1.1).** The mic stays at 48 kHz / 32-bit /
+# stereo (the XVF3800 hardware contract). Channel 0 is AEC-processed audio,
+# routed to the BARK uplink for ASR. Channel 1 is unprocessed audio, fed to
+# micro_wake_word. Stock ESPHome's `i2s_audio` doesn't accept a non-16 kHz
+# microphone source for `micro_wake_word`; formatBCE's `respeaker_microphone`
+# branch patches in the per-source resample + channel-pick that makes 48 kHz
+# input legal here. Wake word for v0.1 is the prebuilt `okay_nabu` model;
+# custom "Hey Buddy" lands as a model-URL swap in v0.2 once trained.
 #
-# **Press-to-talk via the BUT_A mute button.** On the Seeed ReSpeaker
-# XVF3800 + XIAO ESP32S3 board, BUT_A is wired straight to the XVF3800 DSP
-# — the ESP32 never sees the GPIO directly. We observe the press via the
-# DSP's mute state polled over I2C: any mute-on transition fires WAKE +
-# auto-unmute, so the user's voice still reaches us. ~200 ms latency from
-# press to action, limited by the I2C poll interval.
+# **BUT_A press-to-talk (transitional fallback).** On the Seeed ReSpeaker
+# XVF3800 + XIAO ESP32S3 board, BUT_A is wired straight to the XVF3800 DSP —
+# the ESP32 never sees the GPIO directly. We observe the press via the DSP's
+# mute state polled over I2C: any mute-on transition fires WAKE + auto-unmute.
+# Kept here while mWW is being tuned; once mWW is reliable this whole handler
+# gets repurposed to a real mute toggle (press = mute, press again = unmute).
 
 substitutions:
   hub_host: "192.168.1.50"   # VoiceBuddy hub IP on your LAN
@@ -42,6 +46,18 @@ esp32:
   framework:
     type: esp-idf
     version: recommended
+    components:
+      # microWakeWord pulls in TFLite Micro and needs esp-nn for SIMD ops.
+      - espressif/esp-nn==1.1.2
+    sdkconfig_options:
+      # Larger I/D caches → faster mWW inference on the ESP32-S3.
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      # Move read-only data + instruction prefetch to PSRAM so mWW runs while
+      # flash is busy with audio chunks. Costs PSRAM, buys throughput.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
 
 wifi:
   ssid: !secret wifi_ssid
@@ -65,6 +81,18 @@ external_components:
   - source:
       type: local
       path: ../esphome/components
+  # Patched i2s_audio: stock ESPHome rejects non-16 kHz microphone sources
+  # for micro_wake_word; this fork adds per-source resample + channel-pick
+  # so the XVF3800's native 48 kHz / 32-bit / stereo stream is legal input.
+  # Must come BEFORE the respeaker_xvf3800 source so its `i2s_audio`
+  # reference resolves to the patched component.
+  - source:
+      type: git
+      url: https://github.com/formatBCE/esphome
+      ref: respeaker_microphone
+    components:
+      - i2s_audio
+    refresh: 0s
   # Upstream XVF3800 driver + AIC3104 DAC. Required: without the
   # respeaker_xvf3800 block the DSP never enters streaming mode and the I2S
   # input stays silent.
@@ -188,6 +216,34 @@ respeaker_xvf3800:
     version: "1.0.7"
     md5: 043a848f544ff2c7265ac19685daf5de
 
+# Wake-word engine. Channel 1 of i2s_mics is the unprocessed (no AEC) feed,
+# which mWW prefers — AEC can chew up the wake phrase. The patched i2s_audio
+# component above makes the 48 kHz source legal here.
+#
+# Model: prebuilt `okay_nabu` from kahrendt's microWakeWord releases. It's
+# the same model HA Voice PE ships and is well-validated on this exact
+# board. v0.2 swap: train "Hey Buddy" via the kahrendt/microWakeWord Colab,
+# host the resulting .json + .tflite, point `model:` at the new URL.
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: i2s_mics
+    channels: 1
+    # gain_factor: 4   # uncomment if channel 1 is too quiet for reliable detection
+  stop_after_detection: false
+  models:
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+  vad:
+    probability_cutoff: 0.05
+  on_wake_word_detected:
+    - logger.log:
+        format: "wake word detected: %s"
+        args: [ 'wake_word.c_str()' ]
+    - voicebuddy_satellite.wake:
+        wake_id: 1
+        confidence: 230
+
 voicebuddy_satellite:
   id: vb
   hub_host: ${hub_host}
@@ -199,7 +255,11 @@ voicebuddy_satellite:
   speaker: tts_speaker
   on_connected:
     - logger.log: "BARK session opened"
+    # Start mWW only after the BARK session is up — otherwise a wake during
+    # boot fires WAKE into a closed socket and the frame is dropped.
+    - micro_wake_word.start:
   on_disconnected:
     - logger.log: "BARK session closed"
+    - micro_wake_word.stop:
   on_tts_end:
     - voicebuddy_satellite.stop_listening:

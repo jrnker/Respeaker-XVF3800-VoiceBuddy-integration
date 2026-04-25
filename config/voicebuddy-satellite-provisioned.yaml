@@ -112,13 +112,13 @@ web_server:
       name: "Provisioning"
       sorting_weight: -100
 
-# Improv-over-BLE — onboarding from a phone over BLE without joining
-# the AP first. ESPHome wires this into the same wifi: block above; if
-# the user prefers BLE they can use Home Assistant's "Improv" flow or
-# any standalone Improv app. The captive portal is the recommended
-# path; this is here as a no-cost fallback.
-esp32_improv:
-  authorizer: none
+# NOTE: esp32_improv (BLE-based onboarding) was tried here as a
+# "no-cost fallback" but it isn't free — the BLE stack costs ~80 KB
+# of always-on internal SRAM, which on top of mWW + WiFi + speaker
+# chain leaves no headroom: rx_buf_ realloc OOM'd the moment a TTS
+# reply started streaming after the wake. Captive portal alone is
+# the supported onboarding path. Improv-over-BLE was also flagged
+# because `authorizer: none` lets anyone in BLE range re-provision.
 
 logger:
   level: INFO

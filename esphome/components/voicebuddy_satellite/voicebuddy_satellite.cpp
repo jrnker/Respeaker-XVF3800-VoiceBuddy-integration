@@ -43,9 +43,24 @@ struct SockLock {
 // HELLO payload: sat_id(16) | room_id(16) | fw(u32-be) | caps(u32-be)
 static constexpr size_t HELLO_LEN = 16 + 16 + 4 + 4;
 
+// rx_buf_ sizing. Reserve is what we grab up front in setup() so vector
+// growth doesn't fight a fragmented heap mid-stream. Hard cap is the
+// disconnect threshold — if the buffer grows past this the link is
+// pathologically backed up and reconnect is the safer recovery than
+// letting it eat heap until OOM. ESP-IDF's exception stubs abort() on
+// bad_alloc rather than throwing, so we have to *prevent* the failing
+// allocation, not catch it.
+static constexpr size_t RX_BUF_RESERVE = 16 * 1024;
+static constexpr size_t RX_BUF_HARD_CAP = 48 * 1024;
+
 void VoicebuddySatellite::setup() {
   this->resolve_satellite_id_();
-  this->rx_buf_.reserve(2048);
+  // Pre-reserve generous rx headroom up front, before mWW / Wi-Fi / BLE /
+  // speaker chain fragment internal heap. Without this, the first TTS
+  // burst forces vector realloc-doubling at exactly the moment heap is
+  // tightest, and ESP-IDF's exception stubs abort() on bad_alloc rather
+  // than throwing.
+  this->rx_buf_.reserve(RX_BUF_RESERVE);
   this->mic_pcm_buf_.reserve(AUDIO_FRAME_SAMPLES);
   this->sock_mutex_ = xSemaphoreCreateMutex();
 
@@ -394,6 +409,16 @@ void VoicebuddySatellite::process_rx_() {
       break;
     }
     this->last_recv_ms_ = millis();
+    if (this->rx_buf_.size() + static_cast<size_t>(n) > RX_BUF_HARD_CAP) {
+      // Buffer is pathologically backed up — frame parser must be stuck
+      // (e.g. a corrupt length pulled an absurd payload size). Disconnect
+      // before the next insert tries to grow the vector and OOMs.
+      ESP_LOGE(TAG, "rx_buf overflow (%u + %u > %u), forcing reconnect",
+               (unsigned) this->rx_buf_.size(), (unsigned) n,
+               (unsigned) RX_BUF_HARD_CAP);
+      this->disconnect_("rx overflow");
+      return;
+    }
     this->rx_buf_.insert(this->rx_buf_.end(), buf, buf + n);
   }
 

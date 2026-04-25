@@ -372,18 +372,17 @@ interval:
 script:
   - id: do_factory_reset
     then:
-      # Clear the persisted text / number entities so the next boot
-      # falls back into the captive portal. ESPHome's optimistic+
-      # restore_value: true entities expose .publish_state(); writing
-      # an empty string / default port hits the same NVS slot.
+      # Wipe everything ESPHome persisted in NVS in one shot —
+      # WiFi SSID/password AND every `restore_value: true` entity
+      # (the four provisioning text/number entities). ESPHome
+      # exposes the preferences singleton as `global_preferences`;
+      # `.reset()` zeros the backing NVS partition so the next
+      # boot looks like a factory-fresh device. There is no
+      # `wifi.clear_credentials` automation action — this is the
+      # canonical lambda equivalent.
       - lambda: |-
-          id(provisioned_hub_host).publish_state("");
-          id(provisioned_room_id).publish_state("");
-          id(provisioned_satellite_id).publish_state("");
-          id(provisioned_hub_port).publish_state(9102);
-      # Drop the WiFi credentials too — `wifi.clear_credentials`
-      # zeroes the NVS slot ESPHome uses for stored SSID/password.
-      - wifi.clear_credentials:
+          ESP_LOGW("voicebuddy", "wiping NVS for factory reset");
+          global_preferences->reset();
       - delay: 500ms
       - lambda: |-
           ESP_LOGW("voicebuddy", "rebooting into provisioning mode");

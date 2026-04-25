@@ -15,10 +15,15 @@
 #
 # **No microWakeWord in v0.1.** ESPHome 2026.4.x hard-requires a 16 kHz
 # source mic for micro_wake_word, but the stock XVF3800 firmware outputs at
-# 48 kHz and there's no in-software resampler between them. For first-light
-# we trigger an utterance with the BOOT button (GPIO0) — press to start,
-# the hub's VAD ends the utterance, the satellite stops listening when TTS
-# playback finishes. Wake-word integration is on the v0.2 list.
+# 48 kHz and there's no in-software resampler between them. Wake-word
+# integration is on the v0.2 list.
+#
+# **Press-to-talk via the BUT_A mute button.** On the Seeed ReSpeaker
+# XVF3800 + XIAO ESP32S3 board, BUT_A is wired straight to the XVF3800 DSP
+# — the ESP32 never sees the GPIO directly. We observe the press via the
+# DSP's mute state polled over I2C: any mute-on transition fires WAKE +
+# auto-unmute, so the user's voice still reaches us. ~200 ms latency from
+# press to action, limited by the I2C poll interval.
 
 substitutions:
   hub_host: "192.168.1.50"   # VoiceBuddy hub IP on your LAN
@@ -142,28 +147,24 @@ audio_dac:
 respeaker_xvf3800:
   id: respeaker
   address: 0x2C
+  mute_switch:
+    id: mic_mute_switch
+    name: "Microphone Mute"
+    # 200 ms feels snappy enough for press-to-talk while keeping the I2C
+    # bus traffic light. Drop to 100 ms if the press latency feels too
+    # slow on your install.
+    update_interval: 200ms
+    on_turn_on:
+      # User pressed BUT_A. The DSP just muted itself — un-mute it over
+      # I2C so the user's voice reaches the ASR, then fire WAKE.
+      - switch.turn_off: mic_mute_switch
+      - voicebuddy_satellite.wake:
+          wake_id: 99
+          confidence: 255
   firmware:
     url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/refs/heads/main/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
     version: "1.0.7"
     md5: 043a848f544ff2c7265ac19685daf5de
-
-# Press-to-talk on the BOOT button (GPIO0). Pulled-up by the SoC, active-low
-# when pressed. Sends WAKE + starts the mic stream; stop_listening fires when
-# the hub finishes speaking back.
-binary_sensor:
-  - platform: gpio
-    id: ptt_button
-    name: "Push to talk"
-    pin:
-      number: GPIO0
-      mode:
-        input: true
-        pullup: true
-      inverted: true
-    on_press:
-      - voicebuddy_satellite.wake:
-          wake_id: 99
-          confidence: 255
 
 voicebuddy_satellite:
   id: vb

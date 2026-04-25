@@ -267,13 +267,20 @@ That's the BARK handshake — your satellite is talking to the hub.
 
 ## Step 5 — Test it
 
-The minimal example uses **press-to-talk on the BOOT button (GPIO0)**,
-not a wake word. Press and release once to start the utterance, then
-speak. The hub's VAD detects when you stop talking, dispatches the
+The minimal example uses **press-to-talk on the BUT_A mute button**
+(the side button between the two USB-Cs on the Seeed ReSpeaker XVF3800
++ XIAO ESP32S3 board). Press and release once to start the utterance,
+then speak. The hub's VAD detects when you stop talking, dispatches the
 intent, and streams the spoken reply back. The satellite's LED ring
 will not light up yet (LED frames are v0.2 work — see
 `docs/PROTOCOLS.md` §5 in the [VoiceHA](https://github.com/jrnker/VoiceHA)
 repo).
+
+> **Why the mute button?** BUT_A on this board is wired to the XVF3800
+> DSP, not to the ESP32 — the ESP32 never sees the GPIO directly. The
+> minimal YAML treats the DSP's mute state as the press signal: when
+> the press toggles mute on, the firmware un-mutes immediately over
+> I2C and fires WAKE. ~200 ms latency from press to action.
 
 > **Why no wake word in v0.1?** ESPHome 2026.4.x hard-requires a
 > 16 kHz source mic for `micro_wake_word`, but the stock XVF3800
@@ -355,12 +362,13 @@ Arduino IDE Serial Monitor, PuTTY, or another ESPHome instance.
 Close them and try again. Unplugging and replugging the USB cable
 also resets the OS-side handle.
 
-**The BOOT-button press doesn't trigger an utterance:**
-Verify the binary_sensor logs a press: ESPHome should emit a
-`'Push to talk': Sending state ON` line when you press it. If
-nothing logs, the GPIO pin number is wrong for your specific board
-revision — try GPIO9 (some XIAO ESP32S3 variants) or whichever pin
-your board's USR / BOOT button is wired to.
+**Pressing BUT_A doesn't trigger an utterance:**
+Watch the serial log while pressing the button. You should see
+`'Microphone Mute': Sending state ON` followed by `Microphone Mute
+Turned Off` and `[voicebuddy] listening` within ~200 ms. If you see
+no mute event at all, double-check the `respeaker_xvf3800:` block —
+its `mute_switch:` sub-block is what polls the DSP. If the polling
+interval feels too slow, drop `update_interval:` to 100 ms.
 
 **Audio plays back distorted or silent:**
 The minimal YAML uses a `resampler` speaker chain that converts the

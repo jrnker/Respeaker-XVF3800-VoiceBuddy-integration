@@ -120,6 +120,9 @@ microphone:
     channel: stereo
 
 speaker:
+  # Hardware speaker. The XVF3800 drives BCLK/LRCLK as I2S primary and the
+  # AIC3104 DAC sits downstream, so we have to run at 48 kHz / 32-bit /
+  # stereo regardless of what we feed the chain.
   - platform: i2s_audio
     id: i2s_audio_speaker
     sample_rate: 48000
@@ -130,13 +133,28 @@ speaker:
     dac_type: external
     channel: stereo
     timeout: never
+    buffer_duration: 100ms
     audio_dac: aic3104_dac
-  # Resampler so the hub can keep streaming 16 kHz mono PCM-16 while the
-  # I2S DAC runs at its native 48 kHz / 32-bit.
+
+  # Mixer stage: takes 16-bit input from the resampler and produces the
+  # 32-bit / stereo stream that i2s_audio_speaker expects. Without this
+  # stage i2s_audio rejects the stream with "Audio stream settings are
+  # not compatible with this I2S configuration".
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: tts_mixing_input
+        timeout: never
+
+  # Resampler: hub streams 16 kHz / 16-bit / mono PCM; this lifts it to
+  # 48 kHz / 16-bit so the mixer can finish the format conversion.
   - platform: resampler
     id: tts_speaker
-    output_speaker: i2s_audio_speaker
-    sample_rate: 16000
+    output_speaker: tts_mixing_input
+    sample_rate: 48000
     bits_per_sample: 16
 
 audio_dac:

@@ -88,16 +88,20 @@ void VoicebuddySatellite::loop() {
   // we touch the rx side or queue more sends.
   this->flush_tx_pending_();
 
-  // Drain anything pending on the socket.
+  // Drain anything pending on the socket. process_rx_ may update
+  // last_recv_ms_ to a fresher millis() than the `now` snapshot above,
+  // so refresh `now` before the timer comparisons or the unsigned
+  // subtraction underflows and falsely fires the watchdog.
   this->process_rx_();
+  const uint32_t now_post_rx = millis();
 
   if (this->state_ == State::READY) {
-    if (now - this->last_ping_ms_ >= PING_INTERVAL_MS) {
-      this->last_ping_ms_ = now;
+    if (now_post_rx - this->last_ping_ms_ >= PING_INTERVAL_MS) {
+      this->last_ping_ms_ = now_post_rx;
       this->send_frame_(FRAME_PING, nullptr, 0);
     }
     // Liveness watchdog — see WATCHDOG_TIMEOUT_MS for sizing rationale.
-    if (now - this->last_recv_ms_ > WATCHDOG_TIMEOUT_MS) {
+    if (now_post_rx - this->last_recv_ms_ > WATCHDOG_TIMEOUT_MS) {
       this->disconnect_("watchdog");
     }
   }

@@ -605,7 +605,9 @@ void VoicebuddySatellite::play_wake_beep_() {
   if (accepted < total_bytes) {
     // Park the rest in tts_pending_ so loop()'s flush_tts_pending_ drains it.
     size_t remainder = total_bytes - accepted;
-    if (this->tts_pending_.size() + remainder <= TTS_PENDING_SOFT_CAP) {
+    // Wake beep is cosmetic feedback; if tts_pending_ is already near cap
+    // (unlikely between turns), drop the tail silently rather than disconnect.
+    if (this->tts_pending_.size() + remainder <= TTS_PENDING_HARD_CAP) {
       this->tts_pending_.insert(this->tts_pending_.end(),
                                  bytes + accepted, bytes + total_bytes);
     }

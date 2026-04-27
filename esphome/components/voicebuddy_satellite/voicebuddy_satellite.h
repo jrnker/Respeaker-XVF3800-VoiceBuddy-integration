@@ -72,6 +72,23 @@ class VoicebuddySatellite : public Component {
   void set_microphone_source(microphone::MicrophoneSource *s) { mic_source_ = s; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
 
+  // Runtime-config push from the provisioning flow. Unlike set_hub /
+  // set_room_id (compile-time, called once from to_code()) these are
+  // intended to run from `on_boot` after NVS reads. If `host`/`room` are
+  // empty the component stays in DISCONNECTED and try_connect_ will keep
+  // returning early — that's the "first boot, still in provisioning AP"
+  // state. A non-empty push immediately re-arms reconnect.
+  void set_config_runtime(const std::string &host, uint16_t port,
+                          const std::string &room, const std::string &sat);
+  // Drop the active session (if any) and zero out the live config. Used
+  // by the factory-reset gesture; the YAML side still has to wipe the
+  // NVS-backed text/number entities themselves, this only clears the
+  // copies the running component holds.
+  void factory_reset_runtime();
+  bool has_runtime_config() const {
+    return !this->hub_host_.empty() && !this->room_id_.empty();
+  }
+
   // Driven from YAML automations on the wake-word callback.
   void on_wake(uint8_t wake_id, uint8_t confidence);
   void start_listening();
@@ -183,6 +200,38 @@ template<typename... Ts> class StopListeningAction : public Action<Ts...> {
  public:
   explicit StopListeningAction(VoicebuddySatellite *parent) : parent_(parent) {}
   void play(const Ts &...x) override { parent_->stop_listening(); }
+
+ protected:
+  VoicebuddySatellite *parent_;
+};
+
+// Push runtime config in from the provisioning flow. Each templatable
+// pulls its value (typically from a `text:` / `number:` lambda that
+// reads the NVS-backed config entity) on every play(); the runtime
+// setter is a no-op when nothing has changed, so re-running this on
+// boot every time is cheap.
+template<typename... Ts> class SetConfigAction : public Action<Ts...> {
+ public:
+  explicit SetConfigAction(VoicebuddySatellite *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(std::string, hub_host)
+  TEMPLATABLE_VALUE(uint16_t, hub_port)
+  TEMPLATABLE_VALUE(std::string, room_id_value)
+  TEMPLATABLE_VALUE(std::string, satellite_id_value)
+  void play(const Ts &...x) override {
+    parent_->set_config_runtime(this->hub_host_.value(x...),
+                                this->hub_port_.value(x...),
+                                this->room_id_value_.value(x...),
+                                this->satellite_id_value_.value(x...));
+  }
+
+ protected:
+  VoicebuddySatellite *parent_;
+};
+
+template<typename... Ts> class FactoryResetAction : public Action<Ts...> {
+ public:
+  explicit FactoryResetAction(VoicebuddySatellite *parent) : parent_(parent) {}
+  void play(const Ts &...x) override { parent_->factory_reset_runtime(); }
 
  protected:
   VoicebuddySatellite *parent_;

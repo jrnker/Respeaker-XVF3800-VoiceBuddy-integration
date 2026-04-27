@@ -56,6 +56,16 @@ static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 60000;
 static constexpr uint32_t RECONNECT_BACKOFF_MIN_MS = 500;
 static constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 15000;
 
+// =====================================================================
+// VB_DEBUG_TPSTAT — temporary diagnostic logging for TTS chain throughput.
+// Set to 0 to compile out entirely. Grep for "VB_DEBUG_TPSTAT" to find every
+// participating site (this define, header members, cpp tracking points, the
+// periodic log helper, the call from loop()) and rip them out when the
+// speaker-chain sizing investigation is settled. Log lines are tagged
+// "TPSTAT" so they're greppable in serial output too.
+// =====================================================================
+#define VB_DEBUG_TPSTAT 1
+
 class VoicebuddySatellite : public Component {
  public:
   void setup() override;
@@ -165,6 +175,20 @@ class VoicebuddySatellite : public Component {
   CallbackManager<void()> on_disconnected_callbacks_;
   CallbackManager<void()> on_tts_start_callbacks_;
   CallbackManager<void()> on_tts_end_callbacks_;
+
+#if VB_DEBUG_TPSTAT
+  // VB_DEBUG_TPSTAT — running totals for hub→sat ingress and sat→speaker-chain
+  // egress, sampled once per second to derive bytes-per-second + heap and
+  // pending-peak snapshots. Disabled by setting VB_DEBUG_TPSTAT to 0 in this
+  // header; everything below compiles out cleanly.
+  uint32_t debug_last_log_ms_{0};
+  uint32_t debug_bytes_in_total_{0};
+  uint32_t debug_bytes_played_total_{0};
+  uint32_t debug_bytes_in_marker_{0};
+  uint32_t debug_bytes_played_marker_{0};
+  size_t debug_pending_peak_{0};
+  void debug_log_tpstat_(uint32_t now);
+#endif
 };
 
 // --- Automation actions ----------------------------------------------

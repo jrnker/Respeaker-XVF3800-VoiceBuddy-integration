@@ -15,6 +15,10 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#if VB_DEBUG_TPSTAT
+#include <esp_heap_caps.h>
+#endif
+
 namespace esphome {
 namespace voicebuddy_satellite {
 
@@ -163,6 +167,10 @@ void VoicebuddySatellite::loop() {
       this->disconnect_("watchdog");
     }
   }
+
+#if VB_DEBUG_TPSTAT
+  this->debug_log_tpstat_(now_post_rx);
+#endif
 }
 
 void VoicebuddySatellite::set_config_runtime(const std::string &host, uint16_t port,
@@ -494,6 +502,9 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
 void VoicebuddySatellite::flush_tts_pending_() {
   if (this->tts_pending_.empty() || this->speaker_ == nullptr) return;
   size_t accepted = this->speaker_->play(this->tts_pending_.data(), this->tts_pending_.size());
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_played_total_ += accepted;
+#endif
   if (accepted == 0) return;  // chain still full, retry next tick
   if (accepted >= this->tts_pending_.size()) {
     this->tts_pending_.clear();
@@ -512,6 +523,10 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
   if (flags & TTS_FLAG_START) {
     this->on_tts_start_callbacks_.call();
   }
+
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_in_total_ += pcm_len;
+#endif
 
   if (this->speaker_ != nullptr && pcm_len > 0) {
     // ESPHome speaker::Speaker accepts raw PCM. The hub guarantees 16 kHz
@@ -533,8 +548,16 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
         return;
       }
       this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
+#if VB_DEBUG_TPSTAT
+      if (this->tts_pending_.size() > this->debug_pending_peak_) {
+        this->debug_pending_peak_ = this->tts_pending_.size();
+      }
+#endif
     } else {
       size_t accepted = this->speaker_->play(pcm, pcm_len);
+#if VB_DEBUG_TPSTAT
+      this->debug_bytes_played_total_ += accepted;
+#endif
       if (accepted < pcm_len) {
         size_t remainder = pcm_len - accepted;
         if (remainder > TTS_PENDING_HARD_CAP) {
@@ -544,6 +567,11 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
           return;
         }
         this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
+#if VB_DEBUG_TPSTAT
+        if (this->tts_pending_.size() > this->debug_pending_peak_) {
+          this->debug_pending_peak_ = this->tts_pending_.size();
+        }
+#endif
       }
     }
   }
@@ -609,6 +637,9 @@ void VoicebuddySatellite::play_wake_beep_() {
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(pcm.data());
   const size_t total_bytes = pcm.size() * sizeof(int16_t);
   size_t accepted = this->speaker_->play(bytes, total_bytes);
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_played_total_ += accepted;
+#endif
   if (accepted < total_bytes) {
     // Park the rest in tts_pending_ so loop()'s flush_tts_pending_ drains it.
     size_t remainder = total_bytes - accepted;
@@ -659,6 +690,45 @@ void VoicebuddySatellite::on_mic_data_(const std::vector<uint8_t> &data) {
                              this->mic_pcm_buf_.begin() + AUDIO_FRAME_SAMPLES);
   }
 }
+
+#if VB_DEBUG_TPSTAT
+// Periodic throughput / heap snapshot. Called once per loop tick from loop();
+// emits one INFO line per second of activity (rx>0, played>0, or pending>0)
+// so we can chart the speaker chain's actual sustainable drain rate against
+// the hub's send rate. Quiet periods skip logging entirely. Tag prefix
+// "TPSTAT" so the lines are easy to filter in serial output.
+void VoicebuddySatellite::debug_log_tpstat_(uint32_t now) {
+  constexpr uint32_t INTERVAL_MS = 1000;
+  if (this->debug_last_log_ms_ == 0) {
+    this->debug_last_log_ms_ = now;
+    return;
+  }
+  const uint32_t elapsed = now - this->debug_last_log_ms_;
+  if (elapsed < INTERVAL_MS) return;
+
+  const uint32_t bytes_in = this->debug_bytes_in_total_ - this->debug_bytes_in_marker_;
+  const uint32_t bytes_out = this->debug_bytes_played_total_ - this->debug_bytes_played_marker_;
+  const bool any_activity = (bytes_in > 0) || (bytes_out > 0) || !this->tts_pending_.empty();
+
+  if (any_activity) {
+    const uint32_t rx_per_s = (bytes_in * 1000UL) / elapsed;
+    const uint32_t out_per_s = (bytes_out * 1000UL) / elapsed;
+    ESP_LOGI(TAG,
+             "TPSTAT rx=%uB/s out=%uB/s pending=%u(peak %u) free=%u largest=%u",
+             (unsigned) rx_per_s,
+             (unsigned) out_per_s,
+             (unsigned) this->tts_pending_.size(),
+             (unsigned) this->debug_pending_peak_,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
+
+  this->debug_bytes_in_marker_ = this->debug_bytes_in_total_;
+  this->debug_bytes_played_marker_ = this->debug_bytes_played_total_;
+  this->debug_pending_peak_ = this->tts_pending_.size();
+  this->debug_last_log_ms_ = now;
+}
+#endif
 
 }  // namespace voicebuddy_satellite
 }  // namespace esphome

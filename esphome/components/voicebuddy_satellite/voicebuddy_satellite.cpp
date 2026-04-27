@@ -53,14 +53,27 @@ static constexpr size_t HELLO_LEN = 16 + 16 + 4 + 4;
 static constexpr size_t RX_BUF_RESERVE = 16 * 1024;
 static constexpr size_t RX_BUF_HARD_CAP = 48 * 1024;
 
+// tts_pending_ holds PCM bytes the speaker chain rejected so flush_tts_pending_
+// can retry next tick. Same heap-fragmentation hazard as rx_buf_: every realloc
+// during a back-pressure stall risks bad_alloc → abort. We reserve the full cap
+// at setup() so capacity is fixed for the device's lifetime, then refuse any
+// incoming bytes that would push size past it (disconnect → hub re-establishes
+// → cleaner failure than dropping samples and gradually collapsing).
+// 16 kHz / 16-bit / mono = 32 kB/s, so 32 KiB ≈ 1 s of audio — past that
+// user-visible lag would be worse than the disconnect anyway.
+static constexpr size_t TTS_PENDING_HARD_CAP = 32 * 1024;
+
 void VoicebuddySatellite::setup() {
   this->resolve_satellite_id_();
-  // Pre-reserve generous rx headroom up front, before mWW / Wi-Fi / BLE /
+  // Pre-reserve generous buffer headroom up front, before mWW / Wi-Fi / BLE /
   // speaker chain fragment internal heap. Without this, the first TTS
   // burst forces vector realloc-doubling at exactly the moment heap is
   // tightest, and ESP-IDF's exception stubs abort() on bad_alloc rather
-  // than throwing.
+  // than throwing. tts_pending_ is reserved at the same value as its hard
+  // cap so capacity is fixed for the device's lifetime — overflow is then
+  // a clean disconnect rather than an allocation that may not fit.
   this->rx_buf_.reserve(RX_BUF_RESERVE);
+  this->tts_pending_.reserve(TTS_PENDING_HARD_CAP);
   this->mic_pcm_buf_.reserve(AUDIO_FRAME_SAMPLES);
   this->sock_mutex_ = xSemaphoreCreateMutex();
 
@@ -471,11 +484,6 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
   }
 }
 
-// Cap on how many PCM bytes we're willing to hold back when the speaker
-// chain stalls. 16 kHz / 16-bit / mono = 32 kB/s, so 32 KiB ≈ 1 s of audio.
-// Past that the user-visible lag would be worse than dropping samples.
-static constexpr size_t TTS_PENDING_SOFT_CAP = 32 * 1024;
-
 void VoicebuddySatellite::flush_tts_pending_() {
   if (this->tts_pending_.empty() || this->speaker_ == nullptr) return;
   size_t accepted = this->speaker_->play(this->tts_pending_.data(), this->tts_pending_.size());
@@ -506,24 +514,29 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
     // anything above that exceeds the chain's ring buffer and would be
     // dropped, so park the tail in tts_pending_ and feed it from loop().
     if (!this->tts_pending_.empty()) {
-      // Already backed up — append (subject to the soft cap) instead of
-      // calling play() and risking out-of-order chunks.
-      if (this->tts_pending_.size() + pcm_len <= TTS_PENDING_SOFT_CAP) {
-        this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
-      } else {
-        ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
-                 (unsigned) this->tts_pending_.size(), (unsigned) pcm_len);
+      // Already backed up — append instead of calling play() and risking
+      // out-of-order chunks. Cap check is against the reserved capacity:
+      // overflowing here means the speaker chain has been stalled long
+      // enough that we'd rather reset the session than keep accumulating.
+      if (this->tts_pending_.size() + pcm_len > TTS_PENDING_HARD_CAP) {
+        ESP_LOGE(TAG, "tts_pending overflow (%u + %u > %u), forcing reconnect",
+                 (unsigned) this->tts_pending_.size(), (unsigned) pcm_len,
+                 (unsigned) TTS_PENDING_HARD_CAP);
+        this->disconnect_("tts overflow");
+        return;
       }
+      this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
     } else {
       size_t accepted = this->speaker_->play(pcm, pcm_len);
       if (accepted < pcm_len) {
         size_t remainder = pcm_len - accepted;
-        if (remainder <= TTS_PENDING_SOFT_CAP) {
-          this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
-        } else {
-          ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
-                   (unsigned) TTS_PENDING_SOFT_CAP, (unsigned) remainder);
+        if (remainder > TTS_PENDING_HARD_CAP) {
+          ESP_LOGE(TAG, "tts_pending overflow (assign %u > %u), forcing reconnect",
+                   (unsigned) remainder, (unsigned) TTS_PENDING_HARD_CAP);
+          this->disconnect_("tts overflow");
+          return;
         }
+        this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
       }
     }
   }

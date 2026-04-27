@@ -106,11 +106,14 @@ web_server:
   version: 3
   port: 80
   # Sort entities so the four provisioning fields cluster at the top,
-  # ahead of diagnostic ones.
+  # then the audio/wake tuning knobs, then everything else.
   sorting_groups:
     - id: provisioning_group
       name: "Provisioning"
       sorting_weight: -100
+    - id: tuning_group
+      name: "Audio & wake tuning"
+      sorting_weight: -50
 
 # NOTE: esp32_improv (BLE-based onboarding) was tried here as a
 # "no-cost fallback" but it isn't free — the BLE stack costs ~80 KB
@@ -324,6 +327,108 @@ number:
           room_id: !lambda 'return id(provisioned_room_id).state;'
           satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
 
+# --- Audio & wake tuning entities ------------------------------------
+#
+# Three runtime knobs we expose for in-field tuning of the wake-word
+# pipeline plus a couple of read-only diagnostics. See docs/AUDIO-PIPELINE.md
+# for the full audit of what the DSP is doing and what's still off-limits
+# until the upstream respeaker_xvf3800 component grows more schema.
+#
+# Wake-word sensitivity: presets re-quantise mWW's per-model probability
+# cutoff. Pattern lifted from formatBCE's reference YAML — same FAPH
+# numbers (False Accepts Per Hour on the Dinner Party Corpus) annotate
+# the cutoffs. We only ship the okay_nabu cutoff because that's the only
+# model loaded in this config; if more models get added later the lambda
+# needs corresponding lines per kahrendt's published numbers.
+
+select:
+  - platform: template
+    name: "Wake-word sensitivity"
+    id: wake_word_sensitivity
+    icon: mdi:tune-variant
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_option: "Slightly sensitive"
+    options:
+      - "Slightly sensitive"
+      - "Moderately sensitive"
+      - "Very sensitive"
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 1
+    on_value:
+      - lambda: |-
+          // Quantised uint8 probability cutoffs for okay_nabu@20241226.3.
+          // Values from the kahrendt/microWakeWord manifest + the FAPH
+          // numbers measured on the Dinner Party Corpus.
+          if (x == "Slightly sensitive") {
+            id(okay_nabu).set_probability_cutoff(217);   // 0.85 -> 0.000 FAPH (manifest default)
+          } else if (x == "Moderately sensitive") {
+            id(okay_nabu).set_probability_cutoff(176);   // 0.69 -> 0.376 FAPH
+          } else if (x == "Very sensitive") {
+            id(okay_nabu).set_probability_cutoff(143);   // 0.56 -> 0.751 FAPH
+          }
+
+# Voice-direction LED visualiser. Default OFF so we don't burn the
+# on-board LED ring 24/7 — the "sexy demo" feature is opt-in. When ON,
+# the interval below renders a soft blue wedge centered on whichever
+# of the 12 beams the DSP currently picks as loudest. Useful for
+# visually confirming beamforming is tracking the speaker.
+switch:
+  - platform: template
+    name: "Voice direction LEDs"
+    id: led_voice_direction_enabled
+    icon: mdi:radar
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 2
+    turn_on_action:
+      - lambda: 'id(led_voice_direction_enabled).publish_state(true);'
+    turn_off_action:
+      # When disabling, blank the ring once so the last beam doesn't
+      # stay frozen on. The interval below stops repainting.
+      - lambda: |-
+          uint32_t blank[12] = {0};
+          id(respeaker).set_led_ring(blank);
+          id(led_voice_direction_enabled).publish_state(false);
+
+sensor:
+  # Voice/Noise Ratio surfaced as 0-100%. The DSP's own confidence that
+  # what it's hearing is voice rather than noise — diagnostic for "is
+  # the radio drowning the wake out from the DSP's perspective".
+  - platform: template
+    name: "Voice/Noise ratio"
+    id: vnr_value
+    icon: mdi:waveform
+    update_interval: 1s
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 3
+    lambda: |-
+      // read_vnr() returns 0..255 in voice-probability units.
+      return (float) id(respeaker).read_vnr() * 100.0f / 255.0f;
+
+  # User-visible mirror of the internal voice_beam_direction sensor.
+  # Same value, just shows up in the web UI / HA without the noise of
+  # 250ms updates blasting through the entity log.
+  - platform: template
+    name: "Voice direction (sector)"
+    id: voice_beam_visible
+    icon: mdi:compass
+    update_interval: 1s
+    accuracy_decimals: 0
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 4
+    lambda: |-
+      return (float) id(respeaker).read_led_beam_direction();
+
 # --- Long-press factory-reset gesture --------------------------------
 #
 # BUT_A semantics on the XVF3800 board: pressing the physical button
@@ -369,6 +474,40 @@ interval:
             id(do_factory_reset).execute();
           }
 
+  # Voice-direction LED visualiser. Only repaints while the
+  # `led_voice_direction_enabled` switch is on; the switch's turn_off
+  # action also blanks the ring once so the last beam doesn't freeze on.
+  # 250ms matches the led_beam_sensor poll interval — faster just churns
+  # I2C with stale values.
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            switch.is_on: led_voice_direction_enabled
+          then:
+            - lambda: |-
+                constexpr int NUM_LEDS = 12;
+                constexpr int FADE_LEDS = 2;
+                // Beam 0 isn't aligned with LED 0 on this board layout
+                // (formatBCE's reference effect also rotates by 5). If
+                // the visual ends up pointing the wrong direction on a
+                // future board revision, this is the constant to tune.
+                constexpr int LED_OFFSET = 5;
+                if (!id(voice_beam_direction).has_state()) return;
+                int beam = (int) id(voice_beam_direction).state;
+                int target = (beam + LED_OFFSET) % NUM_LEDS;
+                uint32_t colors[NUM_LEDS] = {0};
+                for (int i = 0; i < NUM_LEDS; i++) {
+                  int dist = i - target;
+                  if (dist < 0) dist = -dist;
+                  if (dist > NUM_LEDS / 2) dist = NUM_LEDS - dist;
+                  if (dist > FADE_LEDS) continue;
+                  float bright = 1.0f - (float) dist / (float)(FADE_LEDS + 1);
+                  uint8_t b = (uint8_t)(60.0f * bright);  // dim, USB-shared power
+                  colors[i] = (uint32_t) b;  // R=0, G=0, B=b
+                }
+                id(respeaker).set_led_ring(colors);
+
 script:
   - id: do_factory_reset
     then:
@@ -408,6 +547,15 @@ respeaker_xvf3800:
           confidence: 255
     on_turn_off:
       - lambda: 'id(factory_reset_arm_ms) = 0;'
+  # 0..11 sector index of the strongest voice beam (12 sectors × 30°).
+  # `internal: true` keeps it out of the web_server entity list — it's a
+  # diagnostic the LED interval below reads, plus the standalone
+  # "Voice direction (sector)" template sensor mirrors it for users.
+  led_beam_sensor:
+    id: voice_beam_direction
+    name: "Voice beam (raw index)"
+    internal: true
+    update_interval: 250ms
   firmware:
     url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/refs/heads/main/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
     version: "1.0.7"

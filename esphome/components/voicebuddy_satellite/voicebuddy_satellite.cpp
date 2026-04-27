@@ -442,6 +442,13 @@ void VoicebuddySatellite::process_rx_() {
     uint16_t len = (uint16_t(this->rx_buf_[1]) << 8) | uint16_t(this->rx_buf_[2]);
     if (this->rx_buf_.size() < HEADER_LEN + len) return;
     this->handle_frame_(typ, this->rx_buf_.data() + HEADER_LEN, len);
+    // handle_frame_ may have called disconnect_ (e.g. tts_pending_ overflow
+    // from inside handle_tts_audio_), which already clears rx_buf_. Erasing
+    // the would-be-frame range from a now-empty buffer is UB and corrupts
+    // size_t into a huge wrapped value, after which the next iteration reads
+    // garbage memory as if it were a frame header — which is how a single
+    // overflow turns into a watchdog-tripping spin loop. Bail out cleanly.
+    if (this->state_ == State::DISCONNECTED) return;
     this->rx_buf_.erase(this->rx_buf_.begin(), this->rx_buf_.begin() + HEADER_LEN + len);
   }
 }

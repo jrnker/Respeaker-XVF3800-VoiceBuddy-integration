@@ -15,6 +15,10 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#if VB_DEBUG_TPSTAT
+#include <esp_heap_caps.h>
+#endif
+
 namespace esphome {
 namespace voicebuddy_satellite {
 
@@ -53,14 +57,27 @@ static constexpr size_t HELLO_LEN = 16 + 16 + 4 + 4;
 static constexpr size_t RX_BUF_RESERVE = 16 * 1024;
 static constexpr size_t RX_BUF_HARD_CAP = 48 * 1024;
 
+// tts_pending_ holds PCM bytes the speaker chain rejected so flush_tts_pending_
+// can retry next tick. Same heap-fragmentation hazard as rx_buf_: every realloc
+// during a back-pressure stall risks bad_alloc → abort. We reserve the full cap
+// at setup() so capacity is fixed for the device's lifetime, then refuse any
+// incoming bytes that would push size past it (disconnect → hub re-establishes
+// → cleaner failure than dropping samples and gradually collapsing).
+// 16 kHz / 16-bit / mono = 32 kB/s, so 32 KiB ≈ 1 s of audio — past that
+// user-visible lag would be worse than the disconnect anyway.
+static constexpr size_t TTS_PENDING_HARD_CAP = 32 * 1024;
+
 void VoicebuddySatellite::setup() {
   this->resolve_satellite_id_();
-  // Pre-reserve generous rx headroom up front, before mWW / Wi-Fi / BLE /
+  // Pre-reserve generous buffer headroom up front, before mWW / Wi-Fi / BLE /
   // speaker chain fragment internal heap. Without this, the first TTS
   // burst forces vector realloc-doubling at exactly the moment heap is
   // tightest, and ESP-IDF's exception stubs abort() on bad_alloc rather
-  // than throwing.
+  // than throwing. tts_pending_ is reserved at the same value as its hard
+  // cap so capacity is fixed for the device's lifetime — overflow is then
+  // a clean disconnect rather than an allocation that may not fit.
   this->rx_buf_.reserve(RX_BUF_RESERVE);
+  this->tts_pending_.reserve(TTS_PENDING_HARD_CAP);
   this->mic_pcm_buf_.reserve(AUDIO_FRAME_SAMPLES);
   this->sock_mutex_ = xSemaphoreCreateMutex();
 
@@ -150,6 +167,10 @@ void VoicebuddySatellite::loop() {
       this->disconnect_("watchdog");
     }
   }
+
+#if VB_DEBUG_TPSTAT
+  this->debug_log_tpstat_(now_post_rx);
+#endif
 }
 
 void VoicebuddySatellite::set_config_runtime(const std::string &host, uint16_t port,
@@ -429,6 +450,13 @@ void VoicebuddySatellite::process_rx_() {
     uint16_t len = (uint16_t(this->rx_buf_[1]) << 8) | uint16_t(this->rx_buf_[2]);
     if (this->rx_buf_.size() < HEADER_LEN + len) return;
     this->handle_frame_(typ, this->rx_buf_.data() + HEADER_LEN, len);
+    // handle_frame_ may have called disconnect_ (e.g. tts_pending_ overflow
+    // from inside handle_tts_audio_), which already clears rx_buf_. Erasing
+    // the would-be-frame range from a now-empty buffer is UB and corrupts
+    // size_t into a huge wrapped value, after which the next iteration reads
+    // garbage memory as if it were a frame header — which is how a single
+    // overflow turns into a watchdog-tripping spin loop. Bail out cleanly.
+    if (this->state_ == State::DISCONNECTED) return;
     this->rx_buf_.erase(this->rx_buf_.begin(), this->rx_buf_.begin() + HEADER_LEN + len);
   }
 }
@@ -471,14 +499,12 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
   }
 }
 
-// Cap on how many PCM bytes we're willing to hold back when the speaker
-// chain stalls. 16 kHz / 16-bit / mono = 32 kB/s, so 32 KiB ≈ 1 s of audio.
-// Past that the user-visible lag would be worse than dropping samples.
-static constexpr size_t TTS_PENDING_SOFT_CAP = 32 * 1024;
-
 void VoicebuddySatellite::flush_tts_pending_() {
   if (this->tts_pending_.empty() || this->speaker_ == nullptr) return;
   size_t accepted = this->speaker_->play(this->tts_pending_.data(), this->tts_pending_.size());
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_played_total_ += accepted;
+#endif
   if (accepted == 0) return;  // chain still full, retry next tick
   if (accepted >= this->tts_pending_.size()) {
     this->tts_pending_.clear();
@@ -498,6 +524,10 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
     this->on_tts_start_callbacks_.call();
   }
 
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_in_total_ += pcm_len;
+#endif
+
   if (this->speaker_ != nullptr && pcm_len > 0) {
     // ESPHome speaker::Speaker accepts raw PCM. The hub guarantees 16 kHz
     // mono PCM-16 little-endian (see hub/.../bark/server.py); the receiver
@@ -506,24 +536,42 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
     // anything above that exceeds the chain's ring buffer and would be
     // dropped, so park the tail in tts_pending_ and feed it from loop().
     if (!this->tts_pending_.empty()) {
-      // Already backed up — append (subject to the soft cap) instead of
-      // calling play() and risking out-of-order chunks.
-      if (this->tts_pending_.size() + pcm_len <= TTS_PENDING_SOFT_CAP) {
-        this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
-      } else {
-        ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
-                 (unsigned) this->tts_pending_.size(), (unsigned) pcm_len);
+      // Already backed up — append instead of calling play() and risking
+      // out-of-order chunks. Cap check is against the reserved capacity:
+      // overflowing here means the speaker chain has been stalled long
+      // enough that we'd rather reset the session than keep accumulating.
+      if (this->tts_pending_.size() + pcm_len > TTS_PENDING_HARD_CAP) {
+        ESP_LOGE(TAG, "tts_pending overflow (%u + %u > %u), forcing reconnect",
+                 (unsigned) this->tts_pending_.size(), (unsigned) pcm_len,
+                 (unsigned) TTS_PENDING_HARD_CAP);
+        this->disconnect_("tts overflow");
+        return;
       }
+      this->tts_pending_.insert(this->tts_pending_.end(), pcm, pcm + pcm_len);
+#if VB_DEBUG_TPSTAT
+      if (this->tts_pending_.size() > this->debug_pending_peak_) {
+        this->debug_pending_peak_ = this->tts_pending_.size();
+      }
+#endif
     } else {
       size_t accepted = this->speaker_->play(pcm, pcm_len);
+#if VB_DEBUG_TPSTAT
+      this->debug_bytes_played_total_ += accepted;
+#endif
       if (accepted < pcm_len) {
         size_t remainder = pcm_len - accepted;
-        if (remainder <= TTS_PENDING_SOFT_CAP) {
-          this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
-        } else {
-          ESP_LOGW(TAG, "tts pending cap %u exceeded, dropping %u bytes",
-                   (unsigned) TTS_PENDING_SOFT_CAP, (unsigned) remainder);
+        if (remainder > TTS_PENDING_HARD_CAP) {
+          ESP_LOGE(TAG, "tts_pending overflow (assign %u > %u), forcing reconnect",
+                   (unsigned) remainder, (unsigned) TTS_PENDING_HARD_CAP);
+          this->disconnect_("tts overflow");
+          return;
         }
+        this->tts_pending_.assign(pcm + accepted, pcm + pcm_len);
+#if VB_DEBUG_TPSTAT
+        if (this->tts_pending_.size() > this->debug_pending_peak_) {
+          this->debug_pending_peak_ = this->tts_pending_.size();
+        }
+#endif
       }
     }
   }
@@ -589,10 +637,15 @@ void VoicebuddySatellite::play_wake_beep_() {
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(pcm.data());
   const size_t total_bytes = pcm.size() * sizeof(int16_t);
   size_t accepted = this->speaker_->play(bytes, total_bytes);
+#if VB_DEBUG_TPSTAT
+  this->debug_bytes_played_total_ += accepted;
+#endif
   if (accepted < total_bytes) {
     // Park the rest in tts_pending_ so loop()'s flush_tts_pending_ drains it.
     size_t remainder = total_bytes - accepted;
-    if (this->tts_pending_.size() + remainder <= TTS_PENDING_SOFT_CAP) {
+    // Wake beep is cosmetic feedback; if tts_pending_ is already near cap
+    // (unlikely between turns), drop the tail silently rather than disconnect.
+    if (this->tts_pending_.size() + remainder <= TTS_PENDING_HARD_CAP) {
       this->tts_pending_.insert(this->tts_pending_.end(),
                                  bytes + accepted, bytes + total_bytes);
     }
@@ -637,6 +690,45 @@ void VoicebuddySatellite::on_mic_data_(const std::vector<uint8_t> &data) {
                              this->mic_pcm_buf_.begin() + AUDIO_FRAME_SAMPLES);
   }
 }
+
+#if VB_DEBUG_TPSTAT
+// Periodic throughput / heap snapshot. Called once per loop tick from loop();
+// emits one INFO line per second of activity (rx>0, played>0, or pending>0)
+// so we can chart the speaker chain's actual sustainable drain rate against
+// the hub's send rate. Quiet periods skip logging entirely. Tag prefix
+// "TPSTAT" so the lines are easy to filter in serial output.
+void VoicebuddySatellite::debug_log_tpstat_(uint32_t now) {
+  constexpr uint32_t INTERVAL_MS = 1000;
+  if (this->debug_last_log_ms_ == 0) {
+    this->debug_last_log_ms_ = now;
+    return;
+  }
+  const uint32_t elapsed = now - this->debug_last_log_ms_;
+  if (elapsed < INTERVAL_MS) return;
+
+  const uint32_t bytes_in = this->debug_bytes_in_total_ - this->debug_bytes_in_marker_;
+  const uint32_t bytes_out = this->debug_bytes_played_total_ - this->debug_bytes_played_marker_;
+  const bool any_activity = (bytes_in > 0) || (bytes_out > 0) || !this->tts_pending_.empty();
+
+  if (any_activity) {
+    const uint32_t rx_per_s = (bytes_in * 1000UL) / elapsed;
+    const uint32_t out_per_s = (bytes_out * 1000UL) / elapsed;
+    ESP_LOGI(TAG,
+             "TPSTAT rx=%uB/s out=%uB/s pending=%u(peak %u) free=%u largest=%u",
+             (unsigned) rx_per_s,
+             (unsigned) out_per_s,
+             (unsigned) this->tts_pending_.size(),
+             (unsigned) this->debug_pending_peak_,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
+
+  this->debug_bytes_in_marker_ = this->debug_bytes_in_total_;
+  this->debug_bytes_played_marker_ = this->debug_bytes_played_total_;
+  this->debug_pending_peak_ = this->tts_pending_.size();
+  this->debug_last_log_ms_ = now;
+}
+#endif
 
 }  // namespace voicebuddy_satellite
 }  // namespace esphome

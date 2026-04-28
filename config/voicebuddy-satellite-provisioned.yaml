@@ -106,11 +106,14 @@ web_server:
   version: 3
   port: 80
   # Sort entities so the four provisioning fields cluster at the top,
-  # ahead of diagnostic ones.
+  # then the audio/wake tuning knobs, then everything else.
   sorting_groups:
     - id: provisioning_group
       name: "Provisioning"
       sorting_weight: -100
+    - id: tuning_group
+      name: "Audio & wake tuning"
+      sorting_weight: -50
 
 # NOTE: esp32_improv (BLE-based onboarding) was tried here as a
 # "no-cost fallback" but it isn't free — the BLE stack costs ~80 KB
@@ -324,6 +327,121 @@ number:
           room_id: !lambda 'return id(provisioned_room_id).state;'
           satellite_id: !lambda 'return id(provisioned_satellite_id).state;'
 
+# --- Audio & wake tuning entities ------------------------------------
+#
+# Three runtime knobs we expose for in-field tuning of the wake-word
+# pipeline plus a couple of read-only diagnostics. See docs/AUDIO-PIPELINE.md
+# for the full audit of what the DSP is doing and what's still off-limits
+# until the upstream respeaker_xvf3800 component grows more schema.
+#
+# Wake-word sensitivity: presets re-quantise mWW's per-model probability
+# cutoff. Pattern lifted from formatBCE's reference YAML — same FAPH
+# numbers (False Accepts Per Hour on the Dinner Party Corpus) annotate
+# the cutoffs. We only ship the okay_nabu cutoff because that's the only
+# model loaded in this config; if more models get added later the lambda
+# needs corresponding lines per kahrendt's published numbers.
+
+select:
+  - platform: template
+    name: "Wake-word sensitivity"
+    id: wake_word_sensitivity
+    icon: mdi:tune-variant
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    initial_option: "Slightly sensitive"
+    options:
+      - "Slightly sensitive"
+      - "Moderately sensitive"
+      - "Very sensitive"
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 1
+    on_value:
+      - lambda: |-
+          // Quantised uint8 probability cutoffs for okay_nabu@20241226.3.
+          // Values from the kahrendt/microWakeWord manifest + the FAPH
+          // numbers measured on the Dinner Party Corpus.
+          if (x == "Slightly sensitive") {
+            id(okay_nabu).set_probability_cutoff(217);   // 0.85 -> 0.000 FAPH (manifest default)
+          } else if (x == "Moderately sensitive") {
+            id(okay_nabu).set_probability_cutoff(176);   // 0.69 -> 0.376 FAPH
+          } else if (x == "Very sensitive") {
+            id(okay_nabu).set_probability_cutoff(143);   // 0.56 -> 0.751 FAPH
+          }
+
+# Voice-direction LED visualiser. Default OFF so we don't burn the
+# on-board LED ring 24/7 — the feature is opt-in.
+#
+# Behaviour while enabled:
+#   idle           → dark
+#   wake fires     → ring lights blue with red LEDs frozen at the beam
+#                    direction captured at that moment. Direction does
+#                    NOT track the beam afterwards — it's a snapshot.
+#   TTS starts     → dark (we're done listening, hub is replying)
+#   disconnect     → dark (BARK session dropped)
+#
+# Implementation: the wake hooks call `paint_listening_leds` once,
+# which snapshots the current beam and writes the ring. There is no
+# repaint loop — the visual stays exactly as painted until the
+# `on_tts_start` / `on_disconnected` hooks blank it.
+switch:
+  - platform: template
+    name: "Voice direction LEDs"
+    id: led_voice_direction_enabled
+    icon: mdi:radar
+    optimistic: true
+    # switch.template persists via restore_mode (text/number/select use
+    # restore_value). RESTORE_DEFAULT_OFF = restore the last-saved state,
+    # fall back to OFF on a fresh device or after a factory reset.
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 2
+    turn_on_action:
+      - lambda: 'id(led_voice_direction_enabled).publish_state(true);'
+    turn_off_action:
+      # When disabling, blank the ring once so the last frame doesn't
+      # stay frozen on. The interval below stops repainting.
+      - lambda: |-
+          uint32_t blank[12] = {0};
+          id(respeaker).set_led_ring(blank);
+          id(led_voice_direction_enabled).publish_state(false);
+
+sensor:
+  # Voice/Noise Ratio surfaced as 0-100%. The DSP's own confidence that
+  # what it's hearing is voice rather than noise — diagnostic for "is
+  # the radio drowning the wake out from the DSP's perspective".
+  - platform: template
+    name: "Voice/Noise ratio"
+    id: vnr_value
+    icon: mdi:waveform
+    update_interval: 1s
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 3
+    lambda: |-
+      // read_vnr() returns 0..255 in voice-probability units.
+      return (float) id(respeaker).read_vnr() * 100.0f / 255.0f;
+
+  # User-visible mirror of the internal voice_beam_direction sensor.
+  # Same value, just shows up in the web UI / HA without the noise of
+  # 250ms updates blasting through the entity log.
+  - platform: template
+    name: "Voice direction (sector)"
+    id: voice_beam_visible
+    icon: mdi:compass
+    update_interval: 1s
+    accuracy_decimals: 0
+    web_server:
+      sorting_group_id: tuning_group
+      sorting_weight: 4
+    lambda: |-
+      return (float) id(respeaker).read_led_beam_direction();
+
 # --- Long-press factory-reset gesture --------------------------------
 #
 # BUT_A semantics on the XVF3800 board: pressing the physical button
@@ -370,6 +488,51 @@ interval:
           }
 
 script:
+  # One-shot LED paint at wake. Snapshots the current beam direction
+  # and writes the ring; the visual then stays frozen until the
+  # tts_start / on_disconnected hooks blank it. No repaint loop, so
+  # the user can shift mid-utterance without the red wedge chasing
+  # them — the captured direction reflects where the wake phrase came
+  # from, which is what the user wants to confirm.
+  - id: paint_listening_leds
+    then:
+      - if:
+          condition:
+            switch.is_on: led_voice_direction_enabled
+          then:
+            - lambda: |-
+                constexpr int NUM_LEDS = 12;
+                // Width of the red wedge in LEDs *each side* of the
+                // captured beam. 0 = single LED; 1 = three LEDs (centre
+                // plus one neighbour each way).
+                constexpr int RED_WIDTH = 1;
+                // Beam 0 isn't aligned with LED 0 on this board layout
+                // (formatBCE's reference effect also rotates by 5).
+                constexpr int LED_OFFSET = 5;
+                constexpr uint8_t BLUE_LEVEL = 50;   // dim, USB-shared power
+                constexpr uint8_t RED_LEVEL  = 150;
+                int target = -1;
+                if (id(voice_beam_direction).has_state()) {
+                  int beam = (int) id(voice_beam_direction).state;
+                  target = (beam + LED_OFFSET) % NUM_LEDS;
+                }
+                uint32_t colors[NUM_LEDS];
+                for (int i = 0; i < NUM_LEDS; i++) {
+                  bool is_red = false;
+                  if (target >= 0) {
+                    int dist = i - target;
+                    if (dist < 0) dist = -dist;
+                    if (dist > NUM_LEDS / 2) dist = NUM_LEDS - dist;
+                    is_red = (dist <= RED_WIDTH);
+                  }
+                  if (is_red) {
+                    colors[i] = ((uint32_t) RED_LEVEL) << 16;  // R only
+                  } else {
+                    colors[i] = (uint32_t) BLUE_LEVEL;         // B only
+                  }
+                }
+                id(respeaker).set_led_ring(colors);
+
   - id: do_factory_reset
     then:
       # Wipe everything ESPHome persisted in NVS in one shot —
@@ -403,11 +566,21 @@ respeaker_xvf3800:
       # Runs immediately on press; if the long-press path also fires
       # later we'll reset the device anyway, so the brief WAKE is harmless.
       - switch.turn_off: mic_mute_switch
+      - script.execute: paint_listening_leds
       - voicebuddy_satellite.wake:
           wake_id: 99
           confidence: 255
     on_turn_off:
       - lambda: 'id(factory_reset_arm_ms) = 0;'
+  # 0..11 sector index of the strongest voice beam (12 sectors × 30°).
+  # `internal: true` keeps it out of the web_server entity list — it's a
+  # diagnostic the LED interval below reads, plus the standalone
+  # "Voice direction (sector)" template sensor mirrors it for users.
+  led_beam_sensor:
+    id: voice_beam_direction
+    name: "Voice beam (raw index)"
+    internal: true
+    update_interval: 250ms
   firmware:
     url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/refs/heads/main/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
     version: "1.0.7"
@@ -431,6 +604,7 @@ micro_wake_word:
     - logger.log:
         format: "wake word detected: %s"
         args: [ 'wake_word.c_str()' ]
+    - script.execute: paint_listening_leds
     - voicebuddy_satellite.wake:
         wake_id: 1
         confidence: 230
@@ -451,5 +625,21 @@ voicebuddy_satellite:
   on_disconnected:
     - logger.log: "BARK session closed"
     - micro_wake_word.stop:
+    # Blank the ring on session loss. Without this, if the satellite
+    # loses BARK mid-utterance the listening LEDs stay frozen on
+    # until the next wake.
+    - lambda: |-
+        if (id(led_voice_direction_enabled).state) {
+          uint32_t blank[12] = {0};
+          id(respeaker).set_led_ring(blank);
+        }
+  on_tts_start:
+    # Hub is replying — listening is over. Blank the ring so it goes
+    # dark while TTS plays. Lights up again on the next wake.
+    - lambda: |-
+        if (id(led_voice_direction_enabled).state) {
+          uint32_t blank[12] = {0};
+          id(respeaker).set_led_ring(blank);
+        }
   on_tts_end:
     - voicebuddy_satellite.stop_listening:

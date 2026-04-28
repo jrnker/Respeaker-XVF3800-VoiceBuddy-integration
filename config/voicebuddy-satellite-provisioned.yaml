@@ -381,7 +381,10 @@ switch:
     id: led_voice_direction_enabled
     icon: mdi:radar
     optimistic: true
-    restore_value: true
+    # switch.template persists via restore_mode (text/number/select use
+    # restore_value). RESTORE_DEFAULT_OFF = restore the last-saved state,
+    # fall back to OFF on a fresh device or after a factory reset.
+    restore_mode: RESTORE_DEFAULT_OFF
     entity_category: config
     web_server:
       sorting_group_id: tuning_group

@@ -455,37 +455,48 @@ sensor:
 # Implementation: when the switch goes ON, kick off a 10 s timer; if it
 # stays ON for the full duration, reset. If it goes OFF before the
 # timer fires we cancel.
+#
+# --- DISABLED 2026-04-28 ---------------------------------------------
+# Mute button reverted to its plain hardware mute-toggle behaviour
+# (upstream default). Both the press-to-talk WAKE shortcut and this
+# long-press factory-reset gesture are disabled. Code kept commented
+# below so it can be re-enabled by un-commenting:
+#   1) the `globals:` / `interval:` / `do_factory_reset` script blocks
+#      below, and
+#   2) the `on_turn_on:` / `on_turn_off:` blocks under `mute_switch:`
+#      further down.
+# Factory reset is still reachable via the admin UI / API.
 
-globals:
-  - id: factory_reset_arm_ms
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'
+# globals:
+#   - id: factory_reset_arm_ms
+#     type: uint32_t
+#     restore_value: no
+#     initial_value: '0'
 
-interval:
-  - interval: 500ms
-    then:
-      - lambda: |-
-          // Poll the same mute switch the upstream config exposes. If the
-          // press is still held 10 s after it started, factory-reset.
-          static const uint32_t HOLD_MS = 10000;
-          uint32_t armed_at = id(factory_reset_arm_ms);
-          if (armed_at == 0) return;
-          if (!id(mic_mute_switch).state) {
-            // Released early — abort.
-            id(factory_reset_arm_ms) = 0;
-            return;
-          }
-          if (millis() - armed_at >= HOLD_MS) {
-            ESP_LOGW("voicebuddy", "long-press factory reset triggered");
-            id(factory_reset_arm_ms) = 0;
-            // Wipe the live config inside the running component, drop
-            // the BARK session, then defer the NVS wipe + reboot to
-            // the on_long_press script so logging gets a chance to
-            // flush.
-            id(vb).factory_reset_runtime();
-            id(do_factory_reset).execute();
-          }
+# interval:
+#   - interval: 500ms
+#     then:
+#       - lambda: |-
+#           // Poll the same mute switch the upstream config exposes. If the
+#           // press is still held 10 s after it started, factory-reset.
+#           static const uint32_t HOLD_MS = 10000;
+#           uint32_t armed_at = id(factory_reset_arm_ms);
+#           if (armed_at == 0) return;
+#           if (!id(mic_mute_switch).state) {
+#             // Released early — abort.
+#             id(factory_reset_arm_ms) = 0;
+#             return;
+#           }
+#           if (millis() - armed_at >= HOLD_MS) {
+#             ESP_LOGW("voicebuddy", "long-press factory reset triggered");
+#             id(factory_reset_arm_ms) = 0;
+#             // Wipe the live config inside the running component, drop
+#             // the BARK session, then defer the NVS wipe + reboot to
+#             // the on_long_press script so logging gets a chance to
+#             // flush.
+#             id(vb).factory_reset_runtime();
+#             id(do_factory_reset).execute();
+#           }
 
 script:
   # One-shot LED paint at wake. Snapshots the current beam direction
@@ -533,23 +544,28 @@ script:
                 }
                 id(respeaker).set_led_ring(colors);
 
-  - id: do_factory_reset
-    then:
-      # Wipe everything ESPHome persisted in NVS in one shot —
-      # WiFi SSID/password AND every `restore_value: true` entity
-      # (the four provisioning text/number entities). ESPHome
-      # exposes the preferences singleton as `global_preferences`;
-      # `.reset()` zeros the backing NVS partition so the next
-      # boot looks like a factory-fresh device. There is no
-      # `wifi.clear_credentials` automation action — this is the
-      # canonical lambda equivalent.
-      - lambda: |-
-          ESP_LOGW("voicebuddy", "wiping NVS for factory reset");
-          global_preferences->reset();
-      - delay: 500ms
-      - lambda: |-
-          ESP_LOGW("voicebuddy", "rebooting into provisioning mode");
-          App.safe_reboot();
+  # --- DISABLED 2026-04-28: long-press factory-reset gesture ----------
+  # See the DISABLED block higher up in this file. Re-enable in tandem
+  # with the globals/interval blocks and the mute_switch on_turn_on/
+  # on_turn_off handlers.
+  #
+  # - id: do_factory_reset
+  #   then:
+  #     # Wipe everything ESPHome persisted in NVS in one shot —
+  #     # WiFi SSID/password AND every `restore_value: true` entity
+  #     # (the four provisioning text/number entities). ESPHome
+  #     # exposes the preferences singleton as `global_preferences`;
+  #     # `.reset()` zeros the backing NVS partition so the next
+  #     # boot looks like a factory-fresh device. There is no
+  #     # `wifi.clear_credentials` automation action — this is the
+  #     # canonical lambda equivalent.
+  #     - lambda: |-
+  #         ESP_LOGW("voicebuddy", "wiping NVS for factory reset");
+  #         global_preferences->reset();
+  #     - delay: 500ms
+  #     - lambda: |-
+  #         ESP_LOGW("voicebuddy", "rebooting into provisioning mode");
+  #         App.safe_reboot();
 
 respeaker_xvf3800:
   id: respeaker
@@ -558,20 +574,25 @@ respeaker_xvf3800:
     id: mic_mute_switch
     name: "Microphone Mute"
     update_interval: 200ms
-    on_turn_on:
-      # Arm the long-press timer for the factory-reset interval check
-      # above. If the user lets go before 10 s elapse, the timer aborts.
-      - lambda: 'id(factory_reset_arm_ms) = millis();'
-      # Existing v0.1.1 short-press behaviour: un-mute and fire WAKE.
-      # Runs immediately on press; if the long-press path also fires
-      # later we'll reset the device anyway, so the brief WAKE is harmless.
-      - switch.turn_off: mic_mute_switch
-      - script.execute: paint_listening_leds
-      - voicebuddy_satellite.wake:
-          wake_id: 99
-          confidence: 255
-    on_turn_off:
-      - lambda: 'id(factory_reset_arm_ms) = 0;'
+    # --- DISABLED 2026-04-28: press-to-talk + long-press factory-reset
+    # The hardware mute button is back to its upstream default — pressing
+    # toggles the DSP mic-mute state, nothing more. Re-enable in tandem
+    # with the globals / interval / do_factory_reset blocks above.
+    #
+    # on_turn_on:
+    #   # Arm the long-press timer for the factory-reset interval check
+    #   # above. If the user lets go before 10 s elapse, the timer aborts.
+    #   - lambda: 'id(factory_reset_arm_ms) = millis();'
+    #   # Existing v0.1.1 short-press behaviour: un-mute and fire WAKE.
+    #   # Runs immediately on press; if the long-press path also fires
+    #   # later we'll reset the device anyway, so the brief WAKE is harmless.
+    #   - switch.turn_off: mic_mute_switch
+    #   - script.execute: paint_listening_leds
+    #   - voicebuddy_satellite.wake:
+    #       wake_id: 99
+    #       confidence: 255
+    # on_turn_off:
+    #   - lambda: 'id(factory_reset_arm_ms) = 0;'
   # 0..11 sector index of the strongest voice beam (12 sectors × 30°).
   # `internal: true` keeps it out of the web_server entity list — it's a
   # diagnostic the LED interval below reads, plus the standalone

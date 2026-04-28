@@ -64,7 +64,7 @@ static constexpr uint32_t RECONNECT_BACKOFF_MAX_MS = 15000;
 // speaker-chain sizing investigation is settled. Log lines are tagged
 // "TPSTAT" so they're greppable in serial output too.
 // =====================================================================
-#define VB_DEBUG_TPSTAT 1
+#define VB_DEBUG_TPSTAT 0
 
 class VoicebuddySatellite : public Component {
  public:

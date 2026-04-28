@@ -375,14 +375,16 @@ select:
 #
 # Behaviour while enabled:
 #   idle           → dark
-#   wake fires     → ring lights up blue, with red LEDs at the beam direction
+#   wake fires     → ring lights blue with red LEDs frozen at the beam
+#                    direction captured at that moment. Direction does
+#                    NOT track the beam afterwards — it's a snapshot.
 #   TTS starts     → dark (we're done listening, hub is replying)
 #   disconnect     → dark (BARK session dropped)
 #
-# Implemented as a `listening_active` global flag plus a 250 ms repaint
-# interval (so the red wedge follows the beam if the user moves their
-# head mid-utterance). The wake/tts_start/on_disconnected hooks are
-# what actually flip the flag — see further down in the file.
+# Implementation: the wake hooks call `paint_listening_leds` once,
+# which snapshots the current beam and writes the ring. There is no
+# repaint loop — the visual stays exactly as painted until the
+# `on_tts_start` / `on_disconnected` hooks blank it.
 switch:
   - platform: template
     name: "Voice direction LEDs"
@@ -460,14 +462,6 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  # True while the satellite is actively recording user audio for STT —
-  # i.e. between wake-fired and TTS-start (or session-disconnect). Drives
-  # the LED ring visualiser; nothing else reads it.
-  - id: listening_active
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
 interval:
   - interval: 500ms
     then:
@@ -493,30 +487,27 @@ interval:
             id(do_factory_reset).execute();
           }
 
-  # Voice-direction LED visualiser. Only repaints during an active
-  # listening turn — set on wake, cleared on TTS start / disconnect.
-  # 250 ms matches led_beam_sensor's poll cadence so the red wedge
-  # tracks if the user moves mid-utterance. The lifecycle hooks
-  # (wake / on_tts_start / on_disconnected) are what blank the ring at
-  # the end; this interval just paints the live frame.
-  - interval: 250ms
+script:
+  # One-shot LED paint at wake. Snapshots the current beam direction
+  # and writes the ring; the visual then stays frozen until the
+  # tts_start / on_disconnected hooks blank it. No repaint loop, so
+  # the user can shift mid-utterance without the red wedge chasing
+  # them — the captured direction reflects where the wake phrase came
+  # from, which is what the user wants to confirm.
+  - id: paint_listening_leds
     then:
       - if:
           condition:
-            and:
-              - switch.is_on: led_voice_direction_enabled
-              - lambda: 'return id(listening_active);'
+            switch.is_on: led_voice_direction_enabled
           then:
             - lambda: |-
                 constexpr int NUM_LEDS = 12;
                 // Width of the red wedge in LEDs *each side* of the
-                // active beam. 0 = single LED; 1 = three LEDs (centre
+                // captured beam. 0 = single LED; 1 = three LEDs (centre
                 // plus one neighbour each way).
                 constexpr int RED_WIDTH = 1;
                 // Beam 0 isn't aligned with LED 0 on this board layout
-                // (formatBCE's reference effect also rotates by 5). If
-                // the visual ends up pointing the wrong direction on a
-                // future board revision, this is the constant to tune.
+                // (formatBCE's reference effect also rotates by 5).
                 constexpr int LED_OFFSET = 5;
                 constexpr uint8_t BLUE_LEVEL = 50;   // dim, USB-shared power
                 constexpr uint8_t RED_LEVEL  = 150;
@@ -542,7 +533,6 @@ interval:
                 }
                 id(respeaker).set_led_ring(colors);
 
-script:
   - id: do_factory_reset
     then:
       # Wipe everything ESPHome persisted in NVS in one shot —
@@ -576,7 +566,7 @@ respeaker_xvf3800:
       # Runs immediately on press; if the long-press path also fires
       # later we'll reset the device anyway, so the brief WAKE is harmless.
       - switch.turn_off: mic_mute_switch
-      - lambda: 'id(listening_active) = true;'
+      - script.execute: paint_listening_leds
       - voicebuddy_satellite.wake:
           wake_id: 99
           confidence: 255
@@ -614,7 +604,7 @@ micro_wake_word:
     - logger.log:
         format: "wake word detected: %s"
         args: [ 'wake_word.c_str()' ]
-    - lambda: 'id(listening_active) = true;'
+    - script.execute: paint_listening_leds
     - voicebuddy_satellite.wake:
         wake_id: 1
         confidence: 230
@@ -635,20 +625,18 @@ voicebuddy_satellite:
   on_disconnected:
     - logger.log: "BARK session closed"
     - micro_wake_word.stop:
-    # Drop any in-progress listening state and blank the ring.
-    # Without this, if the satellite loses BARK mid-utterance the
-    # LEDs stay lit until the next wake fires.
+    # Blank the ring on session loss. Without this, if the satellite
+    # loses BARK mid-utterance the listening LEDs stay frozen on
+    # until the next wake.
     - lambda: |-
-        id(listening_active) = false;
         if (id(led_voice_direction_enabled).state) {
           uint32_t blank[12] = {0};
           id(respeaker).set_led_ring(blank);
         }
   on_tts_start:
-    # Hub is replying — recording is over. Blank the ring so it goes
-    # dark while TTS plays. Listening resumes on the next wake.
+    # Hub is replying — listening is over. Blank the ring so it goes
+    # dark while TTS plays. Lights up again on the next wake.
     - lambda: |-
-        id(listening_active) = false;
         if (id(led_voice_direction_enabled).state) {
           uint32_t blank[12] = {0};
           id(respeaker).set_led_ring(blank);

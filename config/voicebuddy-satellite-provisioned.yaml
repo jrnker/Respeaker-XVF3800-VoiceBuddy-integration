@@ -435,7 +435,7 @@ sensor:
   # what it's hearing is voice rather than noise — diagnostic for "is
   # the radio drowning the wake out from the DSP's perspective".
   - platform: template
-    name: "Voice/Noise ratio"
+    name: "Voice-Noise ratio"
     id: vnr_value
     icon: mdi:waveform
     update_interval: 1s

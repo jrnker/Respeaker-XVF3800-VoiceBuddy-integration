@@ -115,6 +115,27 @@ web_server:
       name: "Audio & wake tuning"
       sorting_weight: -50
 
+# OTA — over-the-air firmware updates.
+#
+# Two platforms wired in parallel:
+#
+#   - ``esphome`` opens the legacy native OTA listener on TCP/3232. This
+#     is what ``esphome run --device <ip>`` uploads to. It's how every
+#     iteration loop after the initial USB flash should land on the
+#     device. Password-protected via secrets.yaml.
+#   - ``web_server`` accepts a .bin upload through the existing port-80
+#     UI (the "OTA Update" button at the top of the dashboard). Useful
+#     fallback when the dev box doesn't have ESPHome installed but a
+#     phone or laptop browser does.
+#
+# Without this block, ESPHome compiles the firmware *with no OTA listener
+# at all*, so the only update path is USB — which is fine for the first
+# flash but unsustainable for any further iteration.
+ota:
+  - platform: esphome
+    password: !secret ota_password
+  - platform: web_server
+
 # NOTE: esp32_improv (BLE-based onboarding) was tried here as a
 # "no-cost fallback" but it isn't free — the BLE stack costs ~80 KB
 # of always-on internal SRAM, which on top of mWW + WiFi + speaker
@@ -607,14 +628,30 @@ respeaker_xvf3800:
     version: "1.0.7"
     md5: 043a848f544ff2c7265ac19685daf5de
 
-# Wake-word engine. Identical wiring to the minimal config; the
-# provisioning flow doesn't change anything about how the mic stream is
-# routed into mWW.
+# Wake-word engine.
+#
+# Channel choice (2026-05-03): switched mWW from channel 1 (raw mic) to
+# channel 0 (DSP AEC + NS + AGC + beamforming). Rationale:
+#
+#   - During wake-listening, no TTS is playing, so AEC has nothing to
+#     subtract — its output is functionally identical to the raw mic in
+#     this state. The "AEC chews up the wake phrase" caution from
+#     formatBCE's reference applies to half-duplex / barge-in scenarios
+#     we don't currently exercise (BARK gates wake-during-TTS hub-side).
+#   - NS materially improves wake reliability when a TV / radio / fan is
+#     running in the room — the operator's primary complaint.
+#   - AGC normalises far-field vs near-field speech to consistent levels,
+#     which the okay_nabu model handles better than raw input swings.
+#   - Beamforming spatially suppresses off-axis noise sources.
+#
+# If empirical wake-detection rate drops, the runtime "Wake-word
+# sensitivity" select below already lowers the per-model probability
+# cutoff (Slightly → Moderately → Very) without a re-flash.
 micro_wake_word:
   id: mww
   microphone:
     microphone: i2s_mics
-    channels: 1
+    channels: 0
   stop_after_detection: false
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json

@@ -182,17 +182,25 @@ substitutions:
   room_id: "kitchen"         # any short ASCII name; the hub uses this to label commands
 ```
 
-### 3b — Add your WiFi secrets
+### 3b — Add your WiFi + OTA secrets
 
-ESPHome reads WiFi credentials from a separate file so they don't
-end up in git. Create `config/secrets.yaml`:
+ESPHome reads credentials from a separate file so they don't end up in
+git. Create `config/secrets.yaml`:
 
 ```yaml
 wifi_ssid: "MyHomeWiFi"
 wifi_password: "supersecret"
+# OTA = over-the-air firmware updates. Pick any string; you'll only
+# ever need it again when pushing a new build to a flashed device.
+ota_password: "pick-something-long-and-random"
 ```
 
-(That file is git-ignored already.)
+(That file is git-ignored.)
+
+> **Why OTA needs a password.** Once `ota:` is enabled, anyone on the
+> LAN who can reach the satellite on TCP/3232 can push arbitrary
+> firmware to it. The password gates that. Treat it like an SSH key —
+> it doesn't need to be memorable, just unguessable.
 
 ---
 

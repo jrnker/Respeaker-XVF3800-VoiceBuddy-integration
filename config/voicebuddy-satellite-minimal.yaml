@@ -216,9 +216,16 @@ respeaker_xvf3800:
     version: "1.0.7"
     md5: 043a848f544ff2c7265ac19685daf5de
 
-# Wake-word engine. Channel 1 of i2s_mics is the unprocessed (no AEC) feed,
-# which mWW prefers — AEC can chew up the wake phrase. The patched i2s_audio
-# component above makes the 48 kHz source legal here.
+# Wake-word engine. Channel 0 of i2s_mics is the DSP-processed feed
+# (AEC + NS + AGC + beamforming) — gives mWW the best signal-to-noise
+# ratio when there's a TV / radio / fan in the room. The patched
+# i2s_audio component above makes the 48 kHz source legal here.
+#
+# Why not channel 1 (raw)?  formatBCE's reference YAML uses ch1 with the
+# rationale "AEC can chew up the wake phrase" — true in half-duplex /
+# barge-in scenarios, but BARK gates wake-during-TTS hub-side so AEC
+# has nothing to subtract while we're listening for the wake word, and
+# the NS / AGC / beamforming wins are unambiguous in noisy rooms.
 #
 # Model: prebuilt `okay_nabu` from kahrendt's microWakeWord releases. It's
 # the same model HA Voice PE ships and is well-validated on this exact
@@ -228,8 +235,7 @@ micro_wake_word:
   id: mww
   microphone:
     microphone: i2s_mics
-    channels: 1
-    # gain_factor: 4   # uncomment if channel 1 is too quiet for reliable detection
+    channels: 0
   stop_after_detection: false
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json

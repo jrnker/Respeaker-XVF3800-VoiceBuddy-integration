@@ -1,2 +1,7 @@
 local/
 *.pyc
+
+# ESPHome local-only state — credentials, build artefacts, device cache.
+config/secrets.yaml
+config/.esphome/
+.esphome/

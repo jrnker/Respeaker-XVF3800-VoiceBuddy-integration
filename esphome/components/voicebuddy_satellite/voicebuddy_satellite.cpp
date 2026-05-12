@@ -166,6 +166,15 @@ void VoicebuddySatellite::loop() {
     if (now_post_rx - this->last_recv_ms_ > WATCHDOG_TIMEOUT_MS) {
       this->disconnect_("watchdog");
     }
+    // Training-capture deadline. The hub normally sends CAPTURE_STOP
+    // when its VAD declares end-of-speech; this is the belt-and-braces
+    // path that kicks in if the hub's stop is lost (e.g. link blip).
+    if (this->capturing_ && now_post_rx >= this->capture_deadline_ms_) {
+      ESP_LOGW(TAG, "capture deadline reached, auto-stopping");
+      this->capturing_ = false;
+      this->capture_deadline_ms_ = 0;
+      this->stop_listening();
+    }
   }
 
 #if VB_DEBUG_TPSTAT
@@ -292,6 +301,8 @@ void VoicebuddySatellite::disconnect_(const char *reason) {
   bool was_ready = (this->state_ == State::READY);
   this->state_ = State::DISCONNECTED;
   this->listening_ = false;
+  this->capturing_ = false;
+  this->capture_deadline_ms_ = 0;
   this->mic_pcm_buf_.clear();
   this->rx_buf_.clear();
   this->tts_pending_.clear();
@@ -493,10 +504,44 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
     case FRAME_LED:
       // v0.2: route into the LED ring driver.
       return;
+    case FRAME_CAPTURE_START:
+      this->handle_capture_start_(payload, len);
+      return;
+    case FRAME_CAPTURE_STOP:
+      this->handle_capture_stop_();
+      return;
     default:
       ESP_LOGD(TAG, "ignored frame typ=0x%02x len=%u", typ, len);
       return;
   }
+}
+
+void VoicebuddySatellite::handle_capture_start_(const uint8_t *payload, uint16_t len) {
+  // Payload: u16-be max_duration_ms. Clamp to a sane envelope so a buggy
+  // hub can't pin the mic open indefinitely; the wake-trainer's per-sample
+  // max is 5 s, so 10 s is plenty of belt-and-braces.
+  uint32_t max_ms = 5000;
+  if (len >= 2) {
+    max_ms = (uint32_t(payload[0]) << 8) | uint32_t(payload[1]);
+  }
+  if (max_ms < 500) max_ms = 500;
+  if (max_ms > 10000) max_ms = 10000;
+
+  this->capturing_ = true;
+  this->capture_deadline_ms_ = millis() + max_ms;
+  ESP_LOGI(TAG, "capture start (max %u ms)", (unsigned) max_ms);
+  // start_listening() is the same path mWW uses; it ungates the mic
+  // source. We skip the wake beep deliberately — a beep mid-capture
+  // would land in the training clip.
+  this->start_listening();
+}
+
+void VoicebuddySatellite::handle_capture_stop_() {
+  if (!this->capturing_) return;
+  ESP_LOGI(TAG, "capture stop");
+  this->capturing_ = false;
+  this->capture_deadline_ms_ = 0;
+  this->stop_listening();
 }
 
 void VoicebuddySatellite::flush_tts_pending_() {
@@ -584,6 +629,14 @@ void VoicebuddySatellite::handle_tts_audio_(const uint8_t *payload, uint16_t len
 void VoicebuddySatellite::on_wake(uint8_t wake_id, uint8_t confidence) {
   if (this->state_ != State::READY) {
     ESP_LOGD(TAG, "wake ignored, not ready (state=%d)", static_cast<int>(this->state_));
+    return;
+  }
+  // A fortuitous wake-fire during training capture would (a) play the
+  // beep into the clip and (b) make the hub think a real turn started.
+  // The hub also defends against this, but suppressing at the source
+  // keeps the clip clean if the local mWW is twitchier than the hub.
+  if (this->capturing_) {
+    ESP_LOGD(TAG, "wake suppressed during capture");
     return;
   }
   uint8_t payload[2] = {wake_id, confidence};

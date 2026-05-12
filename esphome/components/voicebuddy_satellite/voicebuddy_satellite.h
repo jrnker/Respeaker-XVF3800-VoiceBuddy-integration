@@ -33,6 +33,12 @@ static constexpr uint8_t FRAME_VAD = 0x12;
 static constexpr uint8_t FRAME_TTS_AUDIO = 0x20;
 static constexpr uint8_t FRAME_STOP_TTS = 0x21;
 static constexpr uint8_t FRAME_LED = 0x30;
+// Hub-initiated training capture: open the mic gate without waiting for
+// a wake-word fire so the hub can collect satellite-domain audio for
+// custom-wake-word training. CAPTURE_START carries u16-be max_duration_ms;
+// the satellite auto-stops at that deadline if CAPTURE_STOP never lands.
+static constexpr uint8_t FRAME_CAPTURE_START = 0x40;
+static constexpr uint8_t FRAME_CAPTURE_STOP = 0x41;
 static constexpr uint8_t FRAME_PING = 0xF0;
 static constexpr uint8_t FRAME_PONG = 0xF1;
 
@@ -104,6 +110,13 @@ class VoicebuddySatellite : public Component {
   void start_listening();
   void stop_listening();
 
+  // True while a hub-initiated training capture is in flight. Exposed
+  // so the YAML can suppress `paint_listening_leds` when a fortuitous
+  // mWW fire lands during a capture — the LED paint script otherwise
+  // leaves the ring lit indefinitely (capture has no on_tts_start to
+  // clear it).
+  bool is_capturing() const { return this->capturing_; }
+
   // Procedural two-tone confirmation, played through the configured speaker
   // when a wake fires. Replaces an audio_file:/media_player: stack we'd
   // otherwise need just for one short beep.
@@ -141,6 +154,11 @@ class VoicebuddySatellite : public Component {
   void handle_tts_audio_(const uint8_t *payload, uint16_t len);
   void on_mic_data_(const std::vector<uint8_t> &data);
   void resolve_satellite_id_();
+  // Hub-initiated training capture. Opens the mic gate without playing
+  // the wake beep and arms an auto-stop timer so a lost CAPTURE_STOP
+  // can't pin the mic open forever.
+  void handle_capture_start_(const uint8_t *payload, uint16_t len);
+  void handle_capture_stop_();
 
   std::string hub_host_;
   uint16_t hub_port_{9102};
@@ -170,6 +188,13 @@ class VoicebuddySatellite : public Component {
   std::vector<uint8_t> tx_pending_;      // bytes deferred from a back-pressured / partial write
   std::vector<uint8_t> tts_pending_;     // PCM bytes the speaker chain didn't accept yet
   std::vector<int16_t> mic_pcm_buf_;     // 16 kHz samples awaiting a 320-sample frame
+
+  // Training-capture state. Non-zero deadline = capture mode active;
+  // suppresses the wake beep + WAKE frame so a fortuitous mWW fire
+  // during training doesn't pollute the clip. loop() force-stops when
+  // millis() passes the deadline.
+  bool capturing_{false};
+  uint32_t capture_deadline_ms_{0};
 
   CallbackManager<void()> on_connected_callbacks_;
   CallbackManager<void()> on_disconnected_callbacks_;

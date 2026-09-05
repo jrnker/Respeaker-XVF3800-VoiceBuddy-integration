@@ -15,9 +15,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#if VB_DEBUG_TPSTAT
 #include <esp_heap_caps.h>
-#endif
+#include <esp_system.h>
 
 namespace esphome {
 namespace voicebuddy_satellite {
@@ -68,6 +67,13 @@ static constexpr size_t RX_BUF_HARD_CAP = 48 * 1024;
 static constexpr size_t TTS_PENDING_HARD_CAP = 32 * 1024;
 
 void VoicebuddySatellite::setup() {
+  // Latch the reset reason once at boot. esp_reset_reason() can be
+  // overwritten later in unusual flows (e.g. a deliberate restart from
+  // app code), so we capture it before anything else runs. The value
+  // travels with every STATUS frame so the hub sees why we last booted.
+  this->boot_reason_ = static_cast<uint8_t>(esp_reset_reason());
+  ESP_LOGI(TAG, "boot_reason=%u (see esp_reset_reason_t)", this->boot_reason_);
+
   this->resolve_satellite_id_();
   // Pre-reserve generous buffer headroom up front, before mWW / Wi-Fi / BLE /
   // speaker chain fragment internal heap. Without this, the first TTS
@@ -161,6 +167,13 @@ void VoicebuddySatellite::loop() {
     if (now_post_rx - this->last_ping_ms_ >= PING_INTERVAL_MS) {
       this->last_ping_ms_ = now_post_rx;
       this->send_frame_(FRAME_PING, nullptr, 0);
+    }
+    // Heartbeat: ship boot reason + uptime + free heap to the hub.
+    // Runs on the main loop's cadence, so it shares the same socket and
+    // mutex as PING — no extra task, no audio-path interference.
+    if (now_post_rx - this->last_status_ms_ >= STATUS_INTERVAL_MS) {
+      this->last_status_ms_ = now_post_rx;
+      this->send_status_();
     }
     // Liveness watchdog — see WATCHDOG_TIMEOUT_MS for sizing rationale.
     if (now_post_rx - this->last_recv_ms_ > WATCHDOG_TIMEOUT_MS) {
@@ -283,6 +296,11 @@ void VoicebuddySatellite::try_connect_() {
   this->rx_buf_.clear();
   this->last_recv_ms_ = millis();
   this->last_ping_ms_ = millis();
+  // Cleared on connect-attempt so a reconnect re-arms STATUS scheduling
+  // from scratch. The first STATUS still goes out from the WELCOME
+  // handler; this just guards against stale millis() from a previous
+  // session driving the loop()-tick comparison.
+  this->last_status_ms_ = millis();
   this->reconnect_delay_ms_ = RECONNECT_BACKOFF_MIN_MS;
   ESP_LOGI(TAG, "connected to hub %s:%u", this->hub_host_.c_str(), this->hub_port_);
   this->send_hello_();
@@ -311,6 +329,31 @@ void VoicebuddySatellite::disconnect_(const char *reason) {
   if (was_ready) {
     this->on_disconnected_callbacks_.call();
   }
+}
+
+void VoicebuddySatellite::send_status_() {
+  // STATUS payload (mirror docs/PROTOCOLS.md §5):
+  //   boot_reason(u8) | flags(u8) | uptime_ms(u32-be) | free_heap(u32-be)
+  // Fixed 10 bytes. The flags byte is reserved for future per-task health
+  // bits without resizing the frame.
+  uint8_t payload[10] = {0};
+  payload[0] = this->boot_reason_;
+  payload[1] = 0;  // flags reserved
+  const uint32_t uptime = millis();
+  payload[2] = static_cast<uint8_t>((uptime >> 24) & 0xFF);
+  payload[3] = static_cast<uint8_t>((uptime >> 16) & 0xFF);
+  payload[4] = static_cast<uint8_t>((uptime >> 8) & 0xFF);
+  payload[5] = static_cast<uint8_t>(uptime & 0xFF);
+  // Use the largest free 8-bit block as the "free heap" metric. Plain
+  // ESP.getFreeHeap() ignores fragmentation; the largest-block reading
+  // is what actually limits the next big allocation (rx_buf, tts chunk).
+  const uint32_t free_heap =
+      static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  payload[6] = static_cast<uint8_t>((free_heap >> 24) & 0xFF);
+  payload[7] = static_cast<uint8_t>((free_heap >> 16) & 0xFF);
+  payload[8] = static_cast<uint8_t>((free_heap >> 8) & 0xFF);
+  payload[9] = static_cast<uint8_t>(free_heap & 0xFF);
+  this->send_frame_(FRAME_STATUS, payload, sizeof(payload));
 }
 
 void VoicebuddySatellite::send_hello_() {
@@ -485,6 +528,12 @@ void VoicebuddySatellite::handle_frame_(uint8_t typ, const uint8_t *payload, uin
       }
       this->state_ = State::READY;
       ESP_LOGI(TAG, "session opened id=%u", this->session_id_);
+      // First STATUS goes out immediately so the hub gets the boot
+      // reason without waiting a full STATUS_INTERVAL_MS. last_status_ms_
+      // is reset to now so the periodic tick in loop() schedules the next
+      // one a full interval later.
+      this->send_status_();
+      this->last_status_ms_ = millis();
       this->on_connected_callbacks_.call();
       return;
     }

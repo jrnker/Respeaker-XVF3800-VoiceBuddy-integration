@@ -27,6 +27,9 @@ namespace voicebuddy_satellite {
 // Wire constants (mirror docs/PROTOCOLS.md §5).
 static constexpr uint8_t FRAME_HELLO = 0x01;
 static constexpr uint8_t FRAME_WELCOME = 0x02;
+// Sat → hub liveness. Carries esp_reset_reason() + uptime_ms + free_heap.
+// Sent once on READY (boot reason) and every STATUS_INTERVAL_MS thereafter.
+static constexpr uint8_t FRAME_STATUS = 0x03;
 static constexpr uint8_t FRAME_AUDIO = 0x10;
 static constexpr uint8_t FRAME_WAKE = 0x11;
 static constexpr uint8_t FRAME_VAD = 0x12;
@@ -55,6 +58,11 @@ static constexpr size_t AUDIO_FRAME_BYTES = 640;
 static constexpr size_t AUDIO_FRAME_SAMPLES = AUDIO_FRAME_BYTES / 2;
 
 static constexpr uint32_t PING_INTERVAL_MS = 10000;
+// Liveness/health frame interval. Slower than PING because it ships
+// real payload (boot reason, uptime, free heap) — the hub side sets
+// LIVENESS_SILENT_THRESHOLD_S to 3× this interval before warning.
+// Sent independently of PING on the same socket; both run from loop().
+static constexpr uint32_t STATUS_INTERVAL_MS = 30000;
 // Hub blocks for 1-3 s on STT+TTS during process_wav_turn(); a 31 s watchdog
 // is too tight when several utterances stack up. 60 s gives us six PING
 // windows to recover before declaring the link dead.
@@ -146,6 +154,9 @@ class VoicebuddySatellite : public Component {
   void try_connect_();
   void disconnect_(const char *reason);
   void send_hello_();
+  // Build + send a STATUS frame. Boot reason is latched at setup() so we
+  // can include it even after a reset has been forgotten by ESPHome.
+  void send_status_();
   bool send_frame_(uint8_t typ, const uint8_t *payload, uint16_t len);
   void flush_tx_pending_();
   void flush_tts_pending_();
@@ -183,6 +194,12 @@ class VoicebuddySatellite : public Component {
   uint32_t reconnect_delay_ms_{RECONNECT_BACKOFF_MIN_MS};
   uint32_t last_ping_ms_{0};
   uint32_t last_recv_ms_{0};
+  // STATUS-send pacing. Reset on each connect so the first STATUS goes
+  // out promptly. boot_reason_ is latched at setup() because
+  // esp_reset_reason() can be cleared by subsequent calls inside IDF;
+  // we want the original value across the whole session.
+  uint32_t last_status_ms_{0};
+  uint8_t boot_reason_{0};
 
   std::vector<uint8_t> rx_buf_;          // accumulating partial frames
   std::vector<uint8_t> tx_pending_;      // bytes deferred from a back-pressured / partial write
